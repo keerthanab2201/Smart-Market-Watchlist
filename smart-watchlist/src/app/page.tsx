@@ -56,14 +56,43 @@ function describe(q: Quote): string {
   return `${dir} ${vol}${th}${rev}.`;
 }
 
-// Since-review evidence for quiet rows — same stock, different interval,
-// labelled as such so it can never contradict the observation read.
-function calmLine(q: Quote): string {
-  const sr = q.sinceReview?.pct;
-  if (sr != null && Math.abs(sr) >= 0.5) {
-    return `${sr >= 0 ? "Up" : "Down"} ${Math.abs(sr).toFixed(1)}% since review — within normal range.`;
-  }
-  return "Holding steady — no unusual volume or volatility.";
+// Compact ordinary-stock row: one aligned grid row (~64px) on desktop,
+// two compact lines on mobile. Signal status and data quality are separate:
+// stale rows never claim calm market behavior.
+function QuietRow({ q, onOpen, onRemove, removing }: {
+  q: Quote; onOpen: (s: string) => void; onRemove: (s: string) => void; removing: boolean;
+}) {
+  const d = directionOf(q.sinceReview?.pct ?? null);
+  const pct = q.sinceReview ? `${d === "down" ? "−" : d === "up" ? "+" : ""}${Math.abs(q.sinceReview.pct).toFixed(2)}%` : "N/A";
+  const pctCls = d === "flat" ? "text-zinc-500" : d === "up" ? "text-emerald-400/90" : "text-red-400/90";
+  const status = q.quality.kind === "stale"
+    ? <span className="text-[11px] text-amber-200/80" title={q.freshnessLabel}>Stale quote</span>
+    : q.quality.kind === "unavailable"
+      ? <span className="text-[11px] text-zinc-500" title={q.freshnessLabel}>Awaiting update</span>
+      : <span className="text-[11px] text-zinc-600" title={q.freshnessLabel}>Fresh</span>;
+  return (
+    <li className="px-3 py-2 hover:bg-zinc-800/40 sm:grid sm:min-h-[64px] sm:grid-cols-[minmax(0,1.7fr)_104px_104px_128px_auto] sm:items-center sm:gap-3 sm:py-1">
+      <div className="flex min-w-0 items-baseline justify-between gap-2">
+        <span className="truncate text-[13px]"><span className="font-mono font-semibold text-zinc-100">{q.symbol}</span><span className="ml-1.5 text-xs text-zinc-400">{q.company}</span></span>
+        <span className="tnum shrink-0 font-mono text-[13px] text-zinc-200 sm:hidden">{fmtMoney(q.symbol, q.price)}</span>
+      </div>
+      <div className="mt-1 flex items-center justify-between gap-2 sm:hidden">
+        <span className={`tnum font-mono text-xs ${pctCls}`} title="Change since your last review">{pct}</span>
+        <span className="flex items-center gap-2">
+          {status}
+          <button onClick={() => onOpen(q.symbol)} aria-label={`View ${q.symbol} details`} className="rounded px-1.5 py-1 text-[11px] text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-500">Details</button>
+          <button onClick={() => onRemove(q.symbol)} disabled={removing} aria-label={`Remove ${q.symbol} from watchlist`} className="rounded px-1.5 py-1 text-[11px] text-zinc-600 hover:bg-zinc-800 hover:text-zinc-300 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-zinc-500">✕</button>
+        </span>
+      </div>
+      <span className="tnum hidden text-right font-mono text-[13px] text-zinc-200 sm:block">{fmtMoney(q.symbol, q.price)}</span>
+      <span className={`tnum hidden text-right font-mono text-xs tabular-nums sm:block ${pctCls}`} title="Change since your last review">{pct}</span>
+      <span className="hidden sm:block">{status}</span>
+      <span className="hidden items-center gap-1 sm:flex">
+        <button onClick={() => onOpen(q.symbol)} aria-label={`View ${q.symbol} details`} className="rounded px-1.5 py-1 text-[11px] text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-500">Details</button>
+        <button onClick={() => onRemove(q.symbol)} disabled={removing} aria-label={`Remove ${q.symbol} from watchlist`} className="rounded px-1.5 py-1 text-[11px] text-zinc-700 hover:bg-zinc-800 hover:text-zinc-300 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-zinc-500">✕</button>
+      </span>
+    </li>
+  );
 }
 
 function Spark({ data, up, baseline, markEvent, label }: { data: number[]; up: boolean; baseline?: number; markEvent?: boolean; label?: boolean }) {
@@ -243,7 +272,7 @@ export default function Home() {
     }
   }, [wlId, loadMeta, loadBriefing]);
 
-  // eslint-disable-next-line react-hooks/set-state-in-effect
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional mount fetch
   useEffect(() => { void boot(); }, [boot]);
   useEffect(() => {
     const t = setInterval(() => { if (wlId && !document.hidden) void loadBriefing(wlId, { quiet: true }); }, 30000);
@@ -462,7 +491,7 @@ export default function Home() {
       : mode === "real-provider" ? "Real provider · delayed" : "Simulated feed";
 
   return (
-    <main className="mx-auto max-w-4xl px-4 py-5">
+    <main className="mx-auto max-w-[1120px] px-4 py-5">
       <header className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800/80 pb-3">
         <div className="flex items-center gap-2">
           <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true" className="shrink-0">
@@ -490,13 +519,17 @@ export default function Home() {
       {demoFrozen && (
         <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-1.5 text-xs text-amber-200/90" role="status">
           <p className="font-medium">Demo mode · Simulated market scenarios</p>
-          <p className="mt-0.5 text-amber-200/70">{demoHint ?? "Advance the scripted scenario step by step."} Your live watchlist is untouched.</p>
+          <p className="mt-0.5 text-amber-200/70">A simulated price spike occurred. Advance to see what happens after it reverses.{demoHint ? ` ${demoHint}` : ""} Your live watchlist is untouched.</p>
           <div className="mt-1.5 flex flex-wrap gap-1.5">
-            <button onClick={() => demoAction("advance")} disabled={demoBusy} className="rounded-lg bg-amber-200/90 px-2.5 py-1 text-xs font-semibold text-zinc-900 hover:bg-amber-200 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-amber-400">Advance scenario</button>
-            <button onClick={() => demoAction("inject")} disabled={demoBusy} className="rounded-lg border border-amber-500/40 px-2.5 py-1 text-xs text-amber-200 hover:border-amber-400 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-amber-400">Inject event now</button>
-            <button onClick={() => demoAction("reset")} disabled={demoBusy} className="rounded-lg border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300 hover:border-zinc-500 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-zinc-500">Reset demo</button>
+            <button onClick={() => demoAction("advance")} disabled={demoBusy} className="rounded-lg bg-amber-200/90 px-2.5 py-1 text-xs font-semibold text-zinc-900 hover:bg-amber-200 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-amber-400">Next scenario</button>
+            <button onClick={() => demoAction("reset")} disabled={demoBusy} className="rounded-lg border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300 hover:border-zinc-500 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-zinc-500">Reset</button>
             <button onClick={exitDemo} className="rounded-lg border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300 hover:border-zinc-500 focus:outline-none focus:ring-2 focus:ring-zinc-500">Exit demo</button>
           </div>
+          <details className="mt-1.5">
+            <summary className="cursor-pointer text-[11px] text-amber-200/70 underline-offset-2 hover:underline focus:outline-none focus:ring-2 focus:ring-amber-400">Demo test controls</summary>
+            <p className="mt-1 text-[11px] text-amber-200/60">While a briefing is open, inject an event, then acknowledge the earlier briefing — the new event stays unread.</p>
+            <button onClick={() => demoAction("inject")} disabled={demoBusy} className="mt-1 rounded-lg border border-amber-500/40 px-2.5 py-1 text-xs text-amber-200 hover:border-amber-400 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-amber-400">Inject event now</button>
+          </details>
         </div>
       )}
 
@@ -538,9 +571,11 @@ export default function Home() {
             </button>
           )}
         </div>
-        {!loading && tracking && trackingSince && (
-          <p className="mt-0.5 text-[11px] text-zinc-500">Baseline: tracking since {new Date(trackingSince).toLocaleString()}</p>
-        )}
+        {!loading && tracking && (reviewedAt ? (
+          <p className="mt-0.5 text-[11px] text-zinc-500">Compared with your review <span title={new Date(reviewedAt).toLocaleString()}>{timeAgo(reviewedAt)}</span></p>
+        ) : trackingSince ? (
+          <p className="mt-0.5 text-[11px] text-zinc-500">Tracking started <span title={new Date(trackingSince).toLocaleString()}>{timeAgo(trackingSince)}</span></p>
+        ) : null)}
         {loading ? (
           <div className="mt-2 space-y-1.5"><Skeleton className="h-4 w-full" /><Skeleton className="h-4 w-2/3" /></div>
         ) : tracking === false ? (
@@ -562,7 +597,7 @@ export default function Home() {
                   <li key={e.id} className="rounded-lg border border-zinc-800/70 p-2">
                     <div className="flex items-baseline justify-between gap-2 text-[13px]">
                       <span className="font-mono font-semibold text-zinc-100">{e.symbol}{e.company ? <span className="ml-1.5 font-sans text-xs font-normal text-zinc-500">{e.company}</span> : null}</span>
-                      <span className="shrink-0 text-[11px] text-zinc-500">{timeAgo(e.occurred_at)}</span>
+                      <span className="shrink-0 text-[11px] text-zinc-500" title={new Date(e.occurred_at).toLocaleString()}>{timeAgo(e.occurred_at)}</span>
                     </div>
                     <div className="mt-1"><TierTag score={e.score} /></div>
                     <p className="mt-1 text-[13px] text-zinc-300">{e.summary}</p>
@@ -594,7 +629,7 @@ export default function Home() {
             {allUnavailable ? (
               <p>Feed unavailable — showing the last accepted quotes below. Treat prices as outdated until the feed recovers.</p>
             ) : staleFeed ? (
-              <p><span className="text-yellow-300">Feed stale.</span> No fresh observations — some of this interval could not be assessed.</p>
+              <p>No new signals detected in the available data.<br /><span className="text-[12px] text-zinc-500">Some quotes are stale, so recent changes may be missing.</span></p>
             ) : events.length === 0 && unreadTotal === 0 ? (
               <p>No significant changes observed since your last review.</p>
             ) : (
@@ -603,7 +638,7 @@ export default function Home() {
           </div>
         )}
         {coverage && coverage.incomplete && (
-          <p className="mt-1.5 rounded-lg border border-yellow-500/25 bg-yellow-500/5 px-2 py-1 text-[11px] text-yellow-200/90" role="note">
+          <p className="mt-1.5 rounded-lg border border-amber-500/20 bg-amber-500/[0.04] px-2 py-1 text-[11px] text-amber-200/70" role="note">
             Coverage gap: {coverage.note}
           </p>
         )}
@@ -664,16 +699,17 @@ export default function Home() {
           ))}
         </div>
         <div className="text-xs" role="group" aria-label="Attention sensitivity">
-          <span className="mr-1.5 text-zinc-500" title="Display filter only — the server stores every event ≥55 regardless">Sensitivity:</span>
-          {(Object.keys(SENS) as SensKey[]).map((k) => (
-            <button key={k} onClick={() => { setSens(k); localStorage.setItem("sw_sens", k); }}
-              aria-pressed={sens === k} title={`Display scores ≥ ${SENS[k]} (server stores ≥${SERVER_STORE_THRESHOLD})`}
-              className={`rounded-lg px-2 py-1 text-[11px] capitalize ${sens === k ? "bg-zinc-800 font-semibold text-zinc-100" : "text-zinc-500 hover:text-zinc-300"} focus:outline-none focus:ring-2 focus:ring-zinc-500`}>
-              {k}
-            </button>
-          ))}
+          <label htmlFor="sens-select" className="mr-1.5 text-zinc-500" title="Sensitivity filters this display only — signals are generated server-side at scores ≥55">Sensitivity:</label>
+          <select id="sens-select" value={sens} onChange={(e) => { const k = e.target.value as SensKey; setSens(k); localStorage.setItem("sw_sens", k); }}
+            title="Display filter only — the server stores every event ≥55 regardless"
+            className="rounded-lg border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs capitalize text-zinc-300 focus:border-zinc-600 focus:outline-none focus:ring-2 focus:ring-zinc-500">
+            {(Object.keys(SENS) as SensKey[]).map((k) => (
+              <option key={k} value={k} className="capitalize">{k} (≥{SENS[k]})</option>
+            ))}
+          </select>
         </div>
       </div>
+      <p className="mt-1 text-[11px] text-zinc-600">Sensitivity filters this display only — signals are generated server-side at scores ≥{SERVER_STORE_THRESHOLD}.</p>
 
       {loading ? (
         <div className="mt-3 space-y-2"><Skeleton className="h-24 w-full" /><Skeleton className="h-24 w-full" /><Skeleton className="h-8 w-full" /></div>
@@ -733,62 +769,48 @@ export default function Home() {
                 })}
               </div>
             </section>
-          ) : filter === "all" && (
+          ) : filter === "all" && !(staleFeed || coverage?.incomplete) && (
             <p className="mt-3 rounded-xl border border-zinc-800/70 bg-zinc-900/30 p-3 text-[13px] text-zinc-400">
               <span className="font-medium text-zinc-200">All quiet.</span> None of your {total} stock{total === 1 ? " is" : "s are"} behaving unusually right now.
+            </p>
+          )}
+          {!loading && total > 0 && filter === "attention" && attn.length === 0 && (
+            <section className="mt-3 rounded-xl border border-zinc-800/70 bg-zinc-900/30 p-3" aria-label="No matching stocks">
+              <p className="text-[13px] text-zinc-300">No stocks match this filter.</p>
+              <p className="mt-0.5 text-xs text-zinc-500">
+                {staleFeed || coverage?.incomplete
+                  ? "Some quotes are stale. New signals may appear after data updates."
+                  : "No significant signals were detected in the available observations."}
+              </p>
+              <button onClick={() => { setFilter("all"); sessionStorage.setItem("sw_filter", "all"); }} className="mt-1.5 rounded-lg border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300 hover:border-zinc-500 focus:outline-none focus:ring-2 focus:ring-zinc-500">
+                Show all stocks
+              </button>
+            </section>
+          )}
+          {!loading && total > 0 && filter === "all" && attn.length === 0 && visibleEvents.length === 0 && (staleFeed || coverage?.incomplete) && (
+            <p className="mt-3 rounded-xl border border-zinc-800/70 bg-zinc-900/30 p-3 text-[13px] text-zinc-400">
+              No new signals detected in the available data. <span className="text-xs text-zinc-500">Some quotes are stale, so recent changes may be missing.</span>
             </p>
           )}
 
           {visibleQuiet.length > 0 && (
             <section className="mt-3" aria-label="Normal">
               <h2 className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Normal ({visibleQuiet.length})</h2>
-              <ul className="hidden divide-y divide-zinc-800/70 rounded-xl border border-zinc-800 bg-zinc-900/40 sm:block">
-                {visibleQuiet.map((q) => {
-                  const d = directionOf(q.sinceReview?.pct ?? null);
-                  return (
-                    <li key={q.symbol} className="flex items-center gap-2 px-2.5 py-1.5 hover:bg-zinc-800/40">
-                      <span className="min-w-0 shrink-0 font-mono text-[13px] font-semibold">{q.symbol}<span className="ml-1.5 hidden font-sans text-[11px] font-normal text-zinc-600 md:inline">{q.company}</span></span>
-                      <span title={bdTitle(q)}><TierTag score={q.score} /></span>
-                      <span className="w-24 shrink-0 text-right font-mono text-[13px] tabular-nums">{fmtMoney(q.symbol, q.price)}</span>
-                      <span className={`w-20 shrink-0 text-right font-mono text-xs tabular-nums ${d === "flat" ? "text-zinc-500" : d === "up" ? "text-emerald-400/90" : "text-red-400/90"}`} title="Change since your last review">
-                        {q.sinceReview ? `${d === "down" ? "−" : d === "up" ? "+" : ""}${Math.abs(q.sinceReview.pct).toFixed(2)}%` : "N/A"}
-                      </span>
-                      <span className="hidden min-w-0 flex-1 truncate text-xs text-zinc-500 lg:inline">{calmLine(q)}</span>
-                      <Spark data={q.sparkline} up={(q.dayChangePct ?? 0) >= 0} baseline={q.prevClose ?? undefined} />
-                      <button onClick={() => openDrawer(q.symbol)} aria-label={`View ${q.symbol} details`} className="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-500">Details</button>
-                      <button onClick={() => remove(q.symbol)} disabled={removing === q.symbol} aria-label={`Remove ${q.symbol} from watchlist`} className="shrink-0 rounded px-1 text-[11px] text-zinc-700 hover:bg-zinc-800 hover:text-zinc-300 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-zinc-500">✕</button>
-                    </li>
-                  );
-                })}
-              </ul>
-              <div className="grid gap-2 sm:hidden">
-                {visibleQuiet.map((q) => {
-                  const d = directionOf(q.sinceReview?.pct ?? null);
-                  return (
-                    <article key={q.symbol} className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="min-w-0 truncate text-sm"><span className="font-mono font-bold">{q.symbol}</span>{q.company ? <span className="ml-1.5 text-xs font-normal text-zinc-500">{q.company}</span> : null}</p>
-                        <button onClick={() => remove(q.symbol)} disabled={removing === q.symbol} aria-label={`Remove ${q.symbol} from watchlist`} className="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-zinc-600 hover:bg-zinc-800 hover:text-zinc-300 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-zinc-500">✕</button>
-                      </div>
-                      <div className="mt-1 flex items-baseline justify-between gap-2">
-                        <span className="font-mono text-base tabular-nums">{fmtMoney(q.symbol, q.price)}</span>
-                        <span className={`font-mono text-sm tabular-nums ${d === "flat" ? "text-zinc-500" : d === "up" ? "text-emerald-400/90" : "text-red-400/90"}`}>
-                          {q.sinceReview ? `${d === "down" ? "−" : d === "up" ? "+" : ""}${Math.abs(q.sinceReview.pct).toFixed(1)}% since review` : "N/A"}
-                        </span>
-                      </div>
-                      <p className="mt-0.5 truncate text-xs text-zinc-500">{calmLine(q)}</p>
-                      <button onClick={() => openDrawer(q.symbol)} aria-label={`View ${q.symbol} details`} className="mt-1.5 text-xs text-zinc-400 underline-offset-2 hover:text-zinc-200 hover:underline focus:outline-none focus:ring-2 focus:ring-zinc-500">Details</button>
-                    </article>
-                  );
-                })}
+              <div className="mb-1 hidden grid-cols-[minmax(0,1.7fr)_104px_104px_128px_auto] items-center gap-3 px-3 text-[10px] font-medium uppercase tracking-wider text-zinc-600 sm:grid" aria-hidden="true">
+                <span>Stock</span><span className="text-right">Price</span><span className="text-right">Since review</span><span>Status</span><span />
               </div>
+              <ul className="divide-y divide-zinc-800/70 rounded-xl border border-zinc-800 bg-zinc-900/40">
+                {visibleQuiet.map((q) => (
+                  <QuietRow key={q.symbol} q={q} onOpen={openDrawer} onRemove={remove} removing={removing === q.symbol} />
+                ))}
+              </ul>
             </section>
           )}
         </>
       )}
 
       <footer className="mt-6 border-t border-zinc-800/70 pt-2.5 text-[11px] leading-relaxed text-zinc-600">
-        <p>Prices are {mode === "real-provider" ? "provider-supplied (delayed)" : "simulated for demonstration"} · Scores compare each stock against its own retained observations · Market hours approximate · Quotes 7d · Events 30d</p>
+        <p>{demoFrozen ? "Simulated data · demo scenario" : quoteSources.size > 0 && [...quoteSources].every((s) => s === "finnhub") ? "Finnhub data · delayed ~60s (unverified)" : quoteSources.size > 0 && [...quoteSources].some((s) => s === "finnhub") ? "Mixed provider and simulated observations" : "Simulated data"}</p>
       </footer>
 
       {drawer && drawerQ && (() => {
@@ -894,6 +916,7 @@ export default function Home() {
             </ul>
             <p className="mt-2.5 text-[13px] text-zinc-300"><span className="font-mono text-amber-300">55+ Worth Watching</span> · <span className="font-mono text-red-300">80+ High Attention</span></p>
             <p className="mt-1.5 text-xs leading-relaxed text-zinc-500">Missing inputs score zero without reweighting. Freshness is shown separately and never inflates a score. No new signals fire when the market is closed.</p>
+            <p className="mt-1.5 border-t border-zinc-800/70 pt-1.5 text-[11px] leading-relaxed text-zinc-600">Observations are sampled about every 60 seconds by one shared scheduler. Quotes are kept 7 days, events 30 days — older gaps are labelled as coverage gaps. Market open/closed is a weekday ET approximation; holidays and early closes aren&apos;t modelled.</p>
           </div>
         </div>
       )}
