@@ -1,0 +1,6 @@
+# reference archives / exports
+*.zip
+
+# OS noise
+.DS_Store
+Thumbs.db
