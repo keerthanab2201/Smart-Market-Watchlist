@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import {
-  db, tx, uid, nowISO, getOrCreateUser, ensureDefaultWatchlist, getOwnedWatchlist,
+  db, baselineFor, sourceTransitions, itemAddedAt, tx, uid, nowISO, getOrCreateUser, ensureDefaultWatchlist, getOwnedWatchlist,
   displayQuote, recentQuotes, readBaseline, readScore, deriveReasons, fetchStatus,
 } from "@/lib/db";
 import { scoreQuote, buildSummary, THRESHOLD, SCORE_VERSION, type ScoredResult } from "@/lib/score";
@@ -63,7 +63,6 @@ export { authorizeIngest, deriveReasons } from "@/lib/db";
 
 export function enrich(symbols: string[], namespace: string, watchlistId: string, userId: string): EnrichedQuote[] {
   const marketOpen = isMarketOpen();
-  const h = db();
   return symbols.map((symbol): EnrichedQuote => {
     // Display prefers the real-provider stream: a valid earlier-dated
     // session quote supersedes newer simulated rows. Simulated history is
@@ -114,8 +113,8 @@ export function enrich(symbols: string[], namespace: string, watchlistId: string
     if (reasons.includes("range_low")) chips.push("new observed low");
     if (reasons.includes("trend_reversal")) chips.push("trend reversal");
 
-    const baseline = h.prepare("SELECT price, as_of FROM item_baselines WHERE watchlist_id = ? AND user_id = ? AND symbol = ?")
-      .get(watchlistId, userId, symbol) as { price: number; as_of: string } | undefined;
+    const baseline = baselineFor(watchlistId, userId, symbol);
+    const priorBaseline = db().prepare("SELECT b.source FROM item_baselines b JOIN items i ON i.id=b.membership_id WHERE b.watchlist_id=? AND b.user_id=? AND b.symbol=?").get(watchlistId,userId,symbol) as {source:string | null} | undefined;
     const sinceReview = baseline && baseline.price > 0 && price > 0
       ? { pct: ((price - baseline.price) / baseline.price) * 100, baselineAsOf: baseline.as_of } : null;
 
@@ -129,7 +128,7 @@ export function enrich(symbols: string[], namespace: string, watchlistId: string
       quality.detail = `Previous simulated data · Finnhub update failed (${timeAgo(fetch.attemptAt)})`;
     }
     const fetchHealth = fetch
-      ? { attemptAt: fetch.attemptAt, outcome: fetch.outcome, providerAsOf: fetch.providerAsOf, reason: fetch.reason }
+      ? { attemptAt: fetch.attemptAt, outcome: fetch.outcome, providerAsOf: fetch.providerAsOf, reason: fetch.reason, lastSuccessAt: fetch.lastSuccessAt ?? null }
       : null;
     return {
       symbol, price, prevClose: prevPrice,
@@ -147,7 +146,7 @@ export function enrich(symbols: string[], namespace: string, watchlistId: string
       } : EMPTY_COMP,
       chips: chips.slice(0, 3),
       company: companyName(symbol), source: last?.source ?? "unknown", asOf: last?.as_of ?? null,
-      sinceReview, quality, version: SCORE_VERSION, currency: currencyFor(symbol),
+      sinceReview, baselineNotice: !baseline && ((priorBaseline && priorBaseline.source !== last?.source) || sourceTransitions(namespace, [symbol]).some(t => (itemAddedAt(watchlistId, symbol) ?? "z") <= t.at)) ? "Data source changed · Set a new review baseline." : null, quality, version: SCORE_VERSION, currency: currencyFor(symbol),
       fetch: fetchHealth,
     };
   });

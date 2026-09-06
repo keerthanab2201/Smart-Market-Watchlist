@@ -46,10 +46,19 @@ export type QuoteKind = "simulated" | "live" | "delayed" | "stale" | "unavailabl
 export function describeQuoteStatus(
   asOf: string | null, source: string, marketOpen: boolean, nowMs = Date.now(),
 ): { kind: QuoteKind; detail: string } {
-  if (!asOf) return { kind: "unavailable", detail: "No accepted observations yet" };
+  if (!asOf) return { kind: "unavailable", detail: "Quote unavailable" };
   const ageS = Math.max(0, (nowMs - new Date(asOf).getTime()) / 1000);
   const ago = ageS < 90 ? "just now" : `${Math.round(ageS / 60)}m ago`;
   const sim = source === "simulated" || source === "demo" || source === "legacy";
+  if (!sim && !marketOpen) {
+    const parts = new Intl.DateTimeFormat("en-CA", {timeZone:"America/New_York", year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hourCycle:"h23"}).formatToParts(new Date(nowMs));
+    const part = (name: string) => parts.find(p => p.type === name)!.value;
+    const day = new Date(Date.UTC(Number(part("year")), Number(part("month"))-1, Number(part("day"))));
+    if (Number(part("hour")) < 16) day.setUTCDate(day.getUTCDate()-1);
+    while (day.getUTCDay() === 0 || day.getUTCDay() === 6) day.setUTCDate(day.getUTCDate()-1);
+    const observed = new Intl.DateTimeFormat("en-CA", {timeZone:"America/New_York",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date(asOf));
+    if (observed === day.toISOString().slice(0,10)) return {kind:"delayed",detail:"Last session · US market closed (ET; weekday schedule approximation)"};
+  }
   if (ageS > 600) {
     return {
       kind: "stale",
@@ -63,7 +72,7 @@ export function describeQuoteStatus(
     return { kind: "delayed", detail: `Last session · observed ${ago}` };
   }
   if (ageS > 90) return { kind: "delayed", detail: `Delayed ${Math.round(ageS / 60)}m` };
-  return { kind: "live", detail: "Live" };
+  return { kind: "live", detail: "Current" };
 }
 
 /**
@@ -75,4 +84,10 @@ export function scoreLabel(score: number, missing: string[]): string {
     return "Insufficient history";
   }
   return String(score);
+}
+
+export function describeEvidence(q: {dayChangePct: number | null; missing: string[]; volRatio: number | null; source: string}): string {
+  if (q.dayChangePct == null || q.missing.includes("baseline") || q.missing.includes("volatility")) return "Not enough distinct observations to assess recent price behavior.";
+  const move = q.dayChangePct === 0 ? "Unchanged since the previous observation" : `${q.dayChangePct > 0 ? "Up" : "Down"} ${Math.abs(q.dayChangePct).toFixed(2)}% since the previous observation`;
+  return move + (q.source === "finnhub" ? ". Volume is not supplied by this feed." : q.volRatio == null ? ". Volume evidence is unavailable." : ` with ${q.volRatio.toFixed(1)}× recent-sample average volume.`);
 }

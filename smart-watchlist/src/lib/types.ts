@@ -24,8 +24,9 @@ export interface EnrichedQuote {
   freshnessLabel: string; isStale: boolean; high52w: number | null; low52w: number | null;
   z: number | null; volRatio: number | null; comp: ScoreComp; chips: string[];
   company: string | null; source: string; asOf: string | null;
+  baselineNotice: string | null;
   sinceReview: { pct: number; baselineAsOf: string } | null;
   quality: { kind: "simulated" | "live" | "delayed" | "stale" | "unavailable"; detail: string };
   version: number; currency: "USD" | "INR";
-  fetch: { attemptAt: string; outcome: string; providerAsOf: string | null; reason: string | null } | null;
+  fetch: { lastSuccessAt?: string | null; attemptAt: string; outcome: string; providerAsOf: string | null; reason: string | null } | null;
 }
