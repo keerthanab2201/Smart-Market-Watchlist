@@ -1,6 +1,6 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { fmtMoney, timeAgo, directionOf } from "@/lib/format";
+import { fmtMoney, timeAgo, directionOf, describeEvidence } from "@/lib/format";
 
 interface Comp { surprise: number; volume: number; threshold: number; reversal: number }
 interface Quality { kind: "simulated" | "live" | "delayed" | "stale" | "unavailable"; detail: string }
@@ -13,9 +13,10 @@ interface Quote {
   high52w: number | null; low52w: number | null;
   z: number | null; volRatio: number | null; comp: Comp; chips: string[];
   company: string | null; source: string; asOf: string | null;
+  baselineNotice: string | null;
   sinceReview: { pct: number; baselineAsOf: string } | null;
   quality: Quality; version: number; currency: "USD" | "INR";
-  fetch: { attemptAt: string; outcome: string; providerAsOf: string | null; reason: string | null } | null;
+  fetch: { lastSuccessAt?: string | null; attemptAt: string; outcome: string; providerAsOf: string | null; reason: string | null } | null;
 }
 interface BriefEvent {
   id: number; symbol: string; company: string | null; score: number;
@@ -45,16 +46,7 @@ function missingLabel(m: string): string {
 
 // Recent-observation evidence (latest vs previous accepted observation).
 function describe(q: Quote): string {
-  const pct = q.dayChangePct;
-  if (pct == null) return "Not available — no prior observation yet.";
-  const dir = pct <= -2 ? "Heavy downside move" : pct < 0 ? "Downward drift"
-    : pct >= 2 ? "Strong upward move" : pct > 0 ? "Upward drift" : "Flat trading";
-  if (Math.abs(pct) < 0.05) return "Flat trading on normal volume.";
-  const vol = q.volRatio != null && q.volRatio >= 1.8 ? `on ${q.volRatio.toFixed(1)}× recent-sample average volume` : "on normal volume";
-  const th = q.reasons.includes("range_high") ? ", reaching a new observed high"
-    : q.reasons.includes("range_low") ? ", reaching a new observed low" : "";
-  const rev = q.reasons.includes("trend_reversal") ? " with a recent trend reversal" : "";
-  return `${dir} ${vol}${th}${rev}.`;
+  return describeEvidence(q);
 }
 
 // Compact ordinary-stock row: one aligned grid row (~64px) on desktop,
@@ -64,7 +56,7 @@ function QuietRow({ q, onOpen, onRemove, removing }: {
   q: Quote; onOpen: (s: string) => void; onRemove: (s: string) => void; removing: boolean;
 }) {
   const d = directionOf(q.sinceReview?.pct ?? null);
-  const pct = q.sinceReview ? `${d === "down" ? "−" : d === "up" ? "+" : ""}${Math.abs(q.sinceReview.pct).toFixed(2)}%` : "No baseline";
+  const pct = q.sinceReview ? `${d === "down" ? "−" : d === "up" ? "+" : ""}${Math.abs(q.sinceReview.pct).toFixed(2)}%` : q.baselineNotice ? "Source changed" : "No baseline";
   const sinceTitle = q.sinceReview
     ? `Change since your last review${q.isStale ? " — quote is stale, baseline may be outdated" : ""}`
     : "No review baseline — review to set one";
@@ -73,12 +65,12 @@ function QuietRow({ q, onOpen, onRemove, removing }: {
     ? <span className="text-[11px] text-amber-200/80" title={q.freshnessLabel}>Stale quote</span>
     : q.quality.kind === "unavailable"
       ? <span className="text-[11px] text-zinc-500" title={q.freshnessLabel}>Awaiting update</span>
-      : <span className="text-[11px] text-zinc-600" title={q.freshnessLabel}>Fresh</span>;
+      : <span className="text-[11px] text-zinc-600" title={q.freshnessLabel}>{q.quality.detail.startsWith("Last session") ? "Last session" : q.missing.length > 0 ? "Insufficient history" : "Current"}</span>;
   return (
     <li className="px-3 py-2 hover:bg-zinc-800/40 sm:grid sm:min-h-[64px] sm:grid-cols-[minmax(0,1.7fr)_104px_104px_128px_auto] sm:items-center sm:gap-3 sm:py-1">
       <div className="flex min-w-0 items-baseline justify-between gap-2">
-        <span className="truncate text-[13px]"><span className="font-mono font-semibold text-zinc-100">{q.symbol}</span><span className="ml-1.5 text-xs text-zinc-400">{q.company}</span></span>
-        <span className="tnum shrink-0 font-mono text-[13px] text-zinc-200 sm:hidden">{fmtMoney(q.symbol, q.price)}</span>
+        <span className="truncate text-[14px]"><span className="font-mono font-semibold text-zinc-100">{q.symbol}</span><span className="ml-1.5 text-xs text-zinc-400">{q.company}</span></span>
+        <span className="tnum shrink-0 font-mono text-[14px] text-zinc-200 sm:hidden">{q.price > 0 ? fmtMoney(q.symbol, q.price) : "Quote unavailable"}</span>
       </div>
       <div className="mt-1 flex items-center justify-between gap-2 sm:hidden">
         <span className={`tnum font-mono text-xs ${pctCls}`} title={sinceTitle}>{pct}</span>
@@ -88,7 +80,7 @@ function QuietRow({ q, onOpen, onRemove, removing }: {
           <button onClick={() => onRemove(q.symbol)} disabled={removing} aria-label={`Remove ${q.symbol} from watchlist`} className="rounded px-1.5 py-1 text-[11px] text-zinc-600 hover:bg-zinc-800 hover:text-zinc-300 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-zinc-500">✕</button>
         </span>
       </div>
-      <span className="tnum hidden text-right font-mono text-[13px] text-zinc-200 sm:block">{fmtMoney(q.symbol, q.price)}</span>
+      <span className="tnum hidden text-right font-mono text-[14px] text-zinc-200 sm:block">{q.price > 0 ? fmtMoney(q.symbol, q.price) : "Quote unavailable"}</span>
       <span className={`tnum hidden text-right font-mono text-xs tabular-nums sm:block ${pctCls}`} title={sinceTitle}>{pct}</span>
       <span className="hidden sm:block">{status}</span>
       <span className="hidden items-center gap-1 sm:flex">
@@ -428,7 +420,10 @@ export default function Home() {
       const r = await fetch(`/api/watchlists/${wlId}/items/${sym}`, { method: "DELETE" });
       if (!r.ok) throw new Error("remove failed");
       setQuotes((q) => q.filter((x) => x.symbol !== sym));
-      pushToast(`${sym} removed — re-adding starts fresh tracking`);
+      setDrawer(null);
+      setHistory([]);
+      await loadBriefing(wlId);
+      pushToast("Stock removed. Adding it again starts a new review baseline; market history is retained.");
     } catch {
       pushToast(`Could not remove ${sym}`);
     } finally {
@@ -481,7 +476,7 @@ export default function Home() {
   const quiet = quotes.filter((q) => q.score < threshold);
   const itemSymbols = new Set(quotes.map((q) => q.symbol));
   const allUnavailable = quotes.length > 0 && quotes.every((q) => q.quality.kind === "unavailable");
-  const staleFeed = quotes.length > 0 && !allUnavailable && quotes.every((q) => q.quality.kind === "stale" || q.quality.kind === "unavailable");
+  const staleFeed = quotes.length > 0 && quotes.some((q) => q.quality.kind === "stale" || q.quality.kind === "unavailable" || q.missing.length > 0 || q.fetch?.outcome === "error");
   const drawerQ = quotes.find((x) => x.symbol === drawer);
   const drawerEvents = drawer ? events.filter((e) => e.symbol === drawer) : [];
   const visibleQuiet = filter === "attention" ? [] : quiet;
@@ -498,7 +493,7 @@ export default function Home() {
   const mixedSources = quoteSources.size > 0 && !allFinnhub && [...quoteSources].some((s) => s === "finnhub");
   const modeLabel = mode === "demo-simulated" || demoFrozen
     ? "Demo · simulated"
-    : allFinnhub ? "Finnhub · delayed"
+    : allFinnhub ? "Finnhub"
       : mixedSources ? "Mixed data sources" : "Simulated feed";
 
   return (
@@ -549,7 +544,7 @@ export default function Home() {
       {!onboardOff && tracking === false && !loading && (
         <div className="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
           <div className="flex items-start justify-between gap-2">
-            <p className="text-[13px] font-medium text-zinc-200">A watchlist that filters the noise.</p>
+            <p className="text-[14px] font-medium text-zinc-200">A watchlist that filters the noise.</p>
             <button aria-label="Dismiss onboarding" onClick={() => { setOnboardOff(true); localStorage.setItem("sw_onboard", "off"); }} className="rounded text-zinc-500 hover:text-zinc-300 focus:outline-none focus:ring-2 focus:ring-zinc-500">✕</button>
           </div>
           <p className="mt-0.5 text-xs leading-relaxed text-zinc-400">
@@ -573,7 +568,7 @@ export default function Home() {
 
       <section className="mt-1.5 rounded-xl border border-zinc-800 bg-zinc-900/40 p-3" aria-label="Since your last review" aria-live="polite">
         <div className="flex items-center justify-between gap-2">
-          <h2 className="text-[13px] font-semibold text-zinc-200">
+          <h2 className="text-[14px] font-semibold text-zinc-200">
             Since your last review{!loading && tracking && unreadTotal > 0 ? ` · ${unreadTotal} unread` : ""}
           </h2>
           {!loading && tracking && (visibleEvents.length + priorVisible.length) > 0 && (
@@ -601,10 +596,10 @@ export default function Home() {
           <div className="mt-2 space-y-1.5"><Skeleton className="h-4 w-full" /><Skeleton className="h-4 w-2/3" /></div>
         ) : tracking === false ? (
           <div className="mt-1">
-            <p className="text-[13px] leading-relaxed text-zinc-400">
+            <p className="text-[14px] leading-relaxed text-zinc-400">
               Start tracking from this point — meaningful changes will appear here for your next visit.
             </p>
-            <button onClick={startTrackingNow} disabled={starting} className="mt-2 rounded-lg bg-zinc-100 px-3 py-1.5 text-[13px] font-semibold text-zinc-900 hover:bg-white disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-zinc-400">
+            <button onClick={startTrackingNow} disabled={starting} className="mt-2 rounded-lg bg-zinc-100 px-3 py-1.5 text-[14px] font-semibold text-zinc-900 hover:bg-white disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-zinc-400">
               {starting ? "Starting…" : "Start tracking from here"}
             </button>
           </div>
@@ -616,12 +611,12 @@ export default function Home() {
                 const net = base && base > 0 ? ((e.observed_price - base) / base) * 100 : null;
                 return (
                   <li key={e.id} className="rounded-lg border border-zinc-800/70 p-2">
-                    <div className="flex items-baseline justify-between gap-2 text-[13px]">
+                    <div className="flex items-baseline justify-between gap-2 text-[14px]">
                       <span className="font-mono font-semibold text-zinc-100">{e.symbol}{e.company ? <span className="ml-1.5 font-sans text-xs font-normal text-zinc-500">{e.company}</span> : null}</span>
                       <span className="shrink-0 text-[11px] text-zinc-500" title={new Date(e.occurred_at).toLocaleString()}>{timeAgo(e.occurred_at)}</span>
                     </div>
                     <div className="mt-1"><TierTag score={e.score} /></div>
-                    <p className="mt-1 text-[13px] text-zinc-300">{e.summary}</p>
+                    <p className="mt-1 text-[14px] text-zinc-300">{e.summary}</p>
                     <p className="tnum mt-0.5 text-[11px] text-zinc-500">
                       Observed {fmtMoney(e.symbol, e.observed_price)}
                       {base ? ` vs baseline ${fmtMoney(e.symbol, base)}` : " (baseline unavailable)"}
@@ -649,7 +644,7 @@ export default function Home() {
                 <ul className="mt-1 space-y-1.5">
                   {priorVisible.map((e) => (
                     <li key={e.id} className="rounded-lg border border-zinc-800/50 p-2 opacity-80">
-                      <div className="flex items-baseline justify-between gap-2 text-[13px]">
+                      <div className="flex items-baseline justify-between gap-2 text-[14px]">
                         <span className="font-mono font-semibold text-zinc-300">{e.symbol}</span>
                         <span className="shrink-0 text-[11px] text-zinc-600" title={new Date(e.occurred_at).toLocaleString()}>{timeAgo(e.occurred_at)}</span>
                       </div>
@@ -663,11 +658,11 @@ export default function Home() {
           </>
         ) : priorVisible.length > 0 ? (
           <div className="mt-1">
-            <p className="text-[13px] text-zinc-400">No new real-provider signals — {priorVisible.length} earlier simulated signal{priorVisible.length === 1 ? "" : "s"} below.</p>
+            <p className="text-[14px] text-zinc-400">No new real-provider signals — {priorVisible.length} earlier simulated signal{priorVisible.length === 1 ? "" : "s"} below.</p>
             <ul className="mt-1.5 space-y-1.5">
               {priorVisible.map((e) => (
                 <li key={e.id} className="rounded-lg border border-zinc-800/50 p-2 opacity-80">
-                  <div className="flex items-baseline justify-between gap-2 text-[13px]">
+                  <div className="flex items-baseline justify-between gap-2 text-[14px]">
                     <span className="font-mono font-semibold text-zinc-300">{e.symbol}</span>
                     <span className="shrink-0 text-[11px] text-zinc-600" title={new Date(e.occurred_at).toLocaleString()}>{timeAgo(e.occurred_at)}</span>
                   </div>
@@ -681,11 +676,11 @@ export default function Home() {
             {ackError && <p className="mt-1.5 text-xs text-red-300" role="alert">{ackError} <button onClick={acknowledge} className="underline">Retry</button></p>}
           </div>
         ) : (
-          <div className="mt-1 text-[13px] leading-relaxed text-zinc-400">
+          <div className="mt-1 text-[14px] leading-relaxed text-zinc-400">
             {allUnavailable ? (
               <p>Feed unavailable — showing the last accepted quotes below. Treat prices as outdated until the feed recovers.</p>
             ) : staleFeed ? (
-              <p>No new signals detected in the available data.<br /><span className="text-[12px] text-zinc-500">Some quotes are stale, so recent changes may be missing.</span></p>
+              <p>No new signals detected in the available data.<br /><span className="text-[12px] text-zinc-500">Some quotes are stale or evidence is incomplete, so recent changes may be missing.</span></p>
             ) : events.length === 0 && unreadTotal === 0 ? (
               <p>No significant changes observed since your last review.</p>
             ) : (
@@ -712,20 +707,20 @@ export default function Home() {
                 if (e.key === "ArrowDown") { e.preventDefault(); setActiveIdx((i) => Math.min(i + 1, suggest.length - 1)); }
                 else if (e.key === "ArrowUp") { e.preventDefault(); setActiveIdx((i) => Math.max(i - 1, -1)); }
               }}
-              className="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-[13px] outline-none placeholder:text-zinc-600 focus:border-zinc-600 focus:ring-2 focus:ring-zinc-700" />
+              className="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-[14px] outline-none placeholder:text-zinc-600 focus:border-zinc-600 focus:ring-2 focus:ring-zinc-700" />
             {suggestOpen && input.trim() && (
               <ul id="ticker-suggest" role="listbox" aria-label="Matching stocks" className="absolute z-10 mt-1 w-full overflow-hidden rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl">
                 {searchBusy ? (
-                  <li className="px-3 py-2 text-[13px] text-zinc-500">Searching…</li>
+                  <li className="px-3 py-2 text-[14px] text-zinc-500">Searching…</li>
                 ) : searchError ? (
-                  <li className="px-3 py-2 text-[13px] text-zinc-500">{searchError}</li>
+                  <li className="px-3 py-2 text-[14px] text-zinc-500">{searchError}</li>
                 ) : suggest.length === 0 ? (
-                  <li className="px-3 py-2 text-[13px] text-zinc-500">No matching symbols</li>
+                  <li className="px-3 py-2 text-[14px] text-zinc-500">No matching symbols</li>
                 ) : suggest.map((s, i) => (
                   <li key={s.symbol} role="option" aria-selected={i === activeIdx}>
                     <button type="button" onMouseDown={() => addSymbol(s.symbol)}
                       onMouseEnter={() => setActiveIdx(i)}
-                      className={`flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-[13px] ${i === activeIdx ? "bg-zinc-800" : ""}`}>
+                      className={`flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-[14px] ${i === activeIdx ? "bg-zinc-800" : ""}`}>
                       <span className="min-w-0"><span className="font-mono font-semibold text-zinc-100">{s.symbol}</span>
                         <span className="ml-2 truncate text-xs text-zinc-400">{s.name}</span>
                         {s.exchange ? <span className="ml-1.5 font-mono text-[10px] text-zinc-600">{s.exchange}</span> : null}</span>
@@ -736,15 +731,15 @@ export default function Home() {
               </ul>
             )}
           </div>
-          <button disabled={addBusy} className="rounded-lg bg-zinc-100 px-3.5 py-1.5 text-[13px] font-semibold text-zinc-900 hover:bg-white disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-zinc-400">
+          <button disabled={addBusy} className="rounded-lg bg-zinc-100 px-3.5 py-1.5 text-[14px] font-semibold text-zinc-900 hover:bg-white disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-zinc-400">
             {addBusy ? "Adding…" : "Add"}
           </button>
         </form>
-        {err && <p className="mt-1.5 text-[13px] text-red-300" role="alert">{err}</p>}
+        {err && <p className="mt-1.5 text-[14px] text-red-300" role="alert">{err}</p>}
       </div>
 
       <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
-        <div className="text-[13px]" role="group" aria-label="List filter">
+        <div className="text-[14px]" role="group" aria-label="List filter">
           <span className="mr-1.5 text-zinc-500">Show:</span>
           {(["all", "attention"] as const).map((f) => (
             <button key={f} onClick={() => { setFilter(f); sessionStorage.setItem("sw_filter", f); }}
@@ -814,7 +809,7 @@ export default function Home() {
                         <p className="mt-1 text-[10px] text-zinc-600">Unavailable: {q.missing.map((m) => missingLabel(m)).join(" · ")}</p>
                       )}
                       <div className="mt-1.5 flex items-end justify-between gap-2">
-                        <span className="font-mono text-xs tabular-nums text-zinc-500">{fmtMoney(q.symbol, q.price)}</span>
+                        <span className="font-mono text-xs tabular-nums text-zinc-500">{q.price > 0 ? fmtMoney(q.symbol, q.price) : "Quote unavailable"}</span>
                         <Spark data={q.sparkline} up={up} baseline={q.prevClose ?? undefined} markEvent={q.score >= threshold} label />
                       </div>
                       <button onClick={() => openDrawer(q.symbol)} className="mt-1.5 text-xs text-zinc-400 underline-offset-2 hover:text-zinc-200 hover:underline focus:outline-none focus:ring-2 focus:ring-zinc-500">
@@ -826,13 +821,13 @@ export default function Home() {
               </div>
             </section>
           ) : filter === "all" && !(staleFeed || coverage?.incomplete) && (
-            <p className="mt-3 rounded-xl border border-zinc-800/70 bg-zinc-900/30 p-3 text-[13px] text-zinc-400">
+            <p className="mt-3 rounded-xl border border-zinc-800/70 bg-zinc-900/30 p-3 text-[14px] text-zinc-400">
               <span className="font-medium text-zinc-200">All quiet.</span> None of your {total} stock{total === 1 ? " is" : "s are"} behaving unusually right now.
             </p>
           )}
           {!loading && total > 0 && filter === "attention" && attn.length === 0 && (
             <section className="mt-3 rounded-xl border border-zinc-800/70 bg-zinc-900/30 p-3" aria-label="No matching stocks">
-              <p className="text-[13px] text-zinc-300">No stocks match this filter.</p>
+              <p className="text-[14px] text-zinc-300">No stocks match this filter.</p>
               <p className="mt-0.5 text-xs text-zinc-500">
                 {staleFeed || coverage?.incomplete
                   ? "Some quotes are stale. New signals may appear after data updates."
@@ -844,14 +839,14 @@ export default function Home() {
             </section>
           )}
           {!loading && total > 0 && filter === "all" && attn.length === 0 && visibleEvents.length === 0 && (staleFeed || coverage?.incomplete) && (
-            <p className="mt-3 rounded-xl border border-zinc-800/70 bg-zinc-900/30 p-3 text-[13px] text-zinc-400">
-              No new signals detected in the available data. <span className="text-xs text-zinc-500">Some quotes are stale, so recent changes may be missing.</span>
+            <p className="mt-3 rounded-xl border border-zinc-800/70 bg-zinc-900/30 p-3 text-[14px] text-zinc-400">
+              No new signals detected in the available data. <span className="text-xs text-zinc-500">{quotes.some(q => q.isStale) ? "Some quotes are stale, so recent changes may be missing." : "Evidence is incomplete; more distinct observations are needed."}</span>
             </p>
           )}
 
           {visibleQuiet.length > 0 && (
-            <section className="mt-3" aria-label="Normal">
-              <h2 className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Normal ({visibleQuiet.length})</h2>
+            <section className="mt-3" aria-label="Other stocks">
+              <h2 className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Other stocks ({visibleQuiet.length})</h2>
               <div className="mb-1 hidden grid-cols-[minmax(0,1.7fr)_104px_104px_128px_auto] items-center gap-3 px-3 text-[10px] font-medium uppercase tracking-wider text-zinc-600 sm:grid" aria-hidden="true">
                 <span>Stock</span><span className="text-right">Price</span><span className="text-right">Since review</span><span>Status</span><span />
               </div>
@@ -866,7 +861,7 @@ export default function Home() {
       )}
 
       <footer className="mt-6 border-t border-zinc-800/70 pt-2.5 text-[11px] leading-relaxed text-zinc-600">
-        <p>{demoFrozen ? "Simulated data · demo scenario" : quoteSources.size > 0 && [...quoteSources].every((s) => s === "finnhub") ? "Finnhub data · delayed ~60s (unverified)" : quoteSources.size > 0 && [...quoteSources].some((s) => s === "finnhub") ? "Mixed provider and simulated observations" : "Simulated data"}</p>
+        <p>{demoFrozen ? "Simulated data · demo scenario" : quoteSources.size > 0 && [...quoteSources].every((s) => s === "finnhub") ? "Finnhub data · provider observation times shown" : quoteSources.size > 0 && [...quoteSources].some((s) => s === "finnhub") ? "Mixed provider and simulated observations" : "Simulated data"}</p>
       </footer>
 
       {drawer && drawerQ && (() => {
@@ -881,10 +876,10 @@ export default function Home() {
               <button data-autofocus onClick={() => setDrawer(null)} aria-label="Close details" className="rounded px-1.5 py-0.5 text-zinc-500 hover:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-500">✕</button>
             </div>
             <div className="mt-1.5 flex items-baseline gap-2">
-              <p className="font-mono text-xl tabular-nums">{fmtMoney(drawerQ.symbol, drawerQ.price)}</p>
-              <p className={`font-mono text-[13px] tabular-nums ${(() => { const d = directionOf(drawerQ.sinceReview?.pct ?? null); return d === "flat" ? "text-zinc-400" : d === "up" ? "text-emerald-300" : "text-red-300"; })()}`}
+              <p className="font-mono text-xl tabular-nums">{drawerQ.price > 0 ? fmtMoney(drawerQ.symbol, drawerQ.price) : "Quote unavailable"}</p>
+              <p className={`font-mono text-[14px] tabular-nums ${(() => { const d = directionOf(drawerQ.sinceReview?.pct ?? null); return d === "flat" ? "text-zinc-400" : d === "up" ? "text-emerald-300" : "text-red-300"; })()}`}
                 title={drawerQ.sinceReview ? `Baseline from ${new Date(drawerQ.sinceReview.baselineAsOf).toLocaleString()}` : undefined}>
-                {drawerQ.sinceReview ? `${drawerQ.sinceReview.pct >= 0 ? "+" : "−"}${Math.abs(drawerQ.sinceReview.pct).toFixed(2)}% since review` : "Not available — review to set a baseline"}
+                {drawerQ.sinceReview ? `${drawerQ.sinceReview.pct >= 0 ? "+" : "−"}${Math.abs(drawerQ.sinceReview.pct).toFixed(2)}% since review` : drawerQ.baselineNotice ?? "No review baseline — review to set one"}
               </p>
             </div>
             <p className={`mt-1.5 font-mono text-xs font-bold uppercase tracking-wider ${tierOf(drawerQ.score) === "high" ? "text-red-300" : tierOf(drawerQ.score) === "watch" ? "text-amber-300" : "text-zinc-500"}`}
@@ -894,7 +889,7 @@ export default function Home() {
                 : `${TIER_LABEL[tierOf(drawerQ.score)]} · ${drawerQ.score}`}
             </p>
             <h4 className="mb-1 mt-3 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Why it matters</h4>
-            <p className="text-[13px] leading-relaxed text-zinc-300">
+            <p className="text-[14px] leading-relaxed text-zinc-300">
               <span className="text-zinc-500">Recent price action: </span>{describe(drawerQ)}
             </p>
             {(drawerQ.missing.includes("baseline") || drawerQ.missing.includes("volatility")) && (
@@ -919,6 +914,7 @@ export default function Home() {
                 {drawerQ.chips.map((c) => <span key={c} className="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-[10px] text-zinc-300">{c}</span>)}
               </div>
             )}
+            {drawerQ.source === "finnhub" && <p className="mt-2 text-sm text-zinc-400">Volume is not supplied by this feed.</p>}
             <h4 className="mb-1 mt-4 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Recent samples</h4>
             <Spark data={[...drawerQ.sparkline]} up={up} baseline={drawerQ.prevClose ?? undefined} markEvent={drawerQ.score >= threshold} />
             <details className="mt-3 rounded-lg border border-zinc-800 bg-zinc-900/50 p-2.5">
@@ -930,7 +926,7 @@ export default function Home() {
                 <Bar label="Trend reversal" pts={drawerQ.comp.reversal} max={15} />
               </div>
               {drawerQ.missing.length > 0 && (
-                <p className="mt-2 text-xs text-zinc-500">Unavailable inputs: {drawerQ.missing.map((m) => missingLabel(m)).join(" · ")} — scored zero without reweighting.</p>
+                <p className="mt-2 text-xs text-zinc-500">Unavailable inputs: {drawerQ.missing.map((m) => m === "volume_baseline" && drawerQ.source === "finnhub" ? "Volume is not supplied by this feed." : missingLabel(m)).join(" · ")} — scored zero without reweighting.</p>
               )}
             </details>
             <div className="mt-3 rounded-lg border border-zinc-800 bg-zinc-900/50 p-2.5 text-xs" aria-label="Data quality">
@@ -939,15 +935,17 @@ export default function Home() {
                 {drawerQ.low52w != null ? ` · observed range ${fmtMoney(drawerQ.symbol, drawerQ.low52w)}–${fmtMoney(drawerQ.symbol, drawerQ.high52w ?? drawerQ.low52w)}` : ""}</p>
               <p className="mt-0.5 text-zinc-500">
                 {drawerQ.fetch
-                  ? `Last check ${timeAgo(drawerQ.fetch.attemptAt)} · ${drawerQ.fetch.outcome === "error" ? `update failed${drawerQ.fetch.reason ? `: ${drawerQ.fetch.reason}` : ""}` : drawerQ.fetch.outcome === "duplicate" ? "update ok — same session observation" : "update ok"}`
+                  ? `Last check ${timeAgo(drawerQ.fetch.attemptAt)} · ${(drawerQ.fetch.outcome === "error" || drawerQ.fetch.outcome === "rejected") ? `update failed${drawerQ.fetch.reason ? `: ${drawerQ.fetch.reason}` : ""}` : drawerQ.fetch.outcome === "duplicate" ? "update ok — same session observation" : "update ok"}`
                   : "No fetch recorded yet"}
               </p>
             </div>
+            {drawerQ.fetch?.lastSuccessAt && <p className="mt-1 text-xs text-zinc-400">Last successful check: {new Date(drawerQ.fetch.lastSuccessAt).toLocaleString()}</p>}
+            {drawerQ.asOf && <p className="mt-1 text-xs text-zinc-400">Provider quote time: {new Date(drawerQ.asOf).toLocaleString()}</p>}
             <details className="mt-3">
               <summary className="cursor-pointer text-xs text-zinc-400 underline-offset-2 hover:text-zinc-200 hover:underline focus:outline-none focus:ring-2 focus:ring-zinc-500">
                 View observations ({history.length})
               </summary>
-              <ul className="tnum mt-1.5 max-h-48 space-y-1 overflow-auto font-mono text-[13px]">
+              <ul className="tnum mt-1.5 max-h-48 space-y-1 overflow-auto font-mono text-[14px]">
                 {history.map((h, i) => (
                   <li key={i} className="flex justify-between text-zinc-400">
                     <span>{fmtMoney(drawerQ.symbol, Number(h.price))}</span>
@@ -968,22 +966,22 @@ export default function Home() {
               <h3 className="text-sm font-bold">How Attention Score Works</h3>
               <button autoFocus onClick={() => setHowOpen(false)} aria-label="Close methodology" className="rounded text-zinc-500 hover:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-500">✕</button>
             </div>
-            <p className="mt-1.5 text-[13px] text-zinc-400">We compare each stock against its own accepted observations — a heuristic for prioritization, not a prediction or recommendation.</p>
-            <p className="mt-1 text-[13px] font-medium text-zinc-200">A 1% move means nothing without context.</p>
+            <p className="mt-1.5 text-[14px] text-zinc-400">We compare each stock against its own accepted observations — a heuristic for prioritization, not a prediction or recommendation.</p>
+            <p className="mt-1 text-[14px] font-medium text-zinc-200">A 1% move means nothing without context.</p>
             <div className="mt-2.5 flex h-2.5 overflow-hidden rounded-full" aria-hidden="true">
               <div className="bg-red-400/80" style={{ width: "40%" }} />
               <div className="bg-amber-400/80" style={{ width: "25%" }} />
               <div className="bg-sky-400/70" style={{ width: "20%" }} />
               <div className="bg-violet-400/70" style={{ width: "15%" }} />
             </div>
-            <ul className="mt-2 space-y-1.5 text-[13px] text-zinc-300">
+            <ul className="mt-2 space-y-1.5 text-[14px] text-zinc-300">
               <li><span className="font-mono text-zinc-100">40 pts · Price surprise</span><br /><span className="text-xs text-zinc-500">Move vs volatility of past moves (needs 5+ samples)</span></li>
               <li><span className="font-mono text-zinc-100">25 pts · Volume anomaly</span><br /><span className="text-xs text-zinc-500">Volume vs recent-sample average (needs 3+ samples)</span></li>
               <li><span className="font-mono text-zinc-100">20 pts · Observed-range events</span><br /><span className="text-xs text-zinc-500">New high/low of the retained observation window — not a 52-week claim</span></li>
               <li><span className="font-mono text-zinc-100">15 pts · Trend reversal</span><br /><span className="text-xs text-zinc-500">Short vs medium sample windows (needs 7 closes)</span></li>
             </ul>
-            <p className="mt-2.5 text-[13px] text-zinc-300"><span className="font-mono text-amber-300">55+ Worth Watching</span> · <span className="font-mono text-red-300">80+ High Attention</span></p>
-            <p className="mt-1.5 text-xs leading-relaxed text-zinc-500">Missing inputs score zero without reweighting. Freshness is shown separately and never inflates a score. No new signals fire when the market is closed. Market open/closed uses a weekday ET approximation — holidays and early closes aren&apos;t modelled.</p>
+            <p className="mt-2.5 text-[14px] text-zinc-300"><span className="font-mono text-amber-300">55+ Worth Watching</span> · <span className="font-mono text-red-300">80+ High Attention</span></p>
+            <p className="mt-1.5 text-xs leading-relaxed text-zinc-500">Missing inputs score zero without reweighting. Freshness is shown separately and never inflates a score. Market open/closed uses a weekday ET approximation — holidays and early closes aren&apos;t modelled.</p>
             <p className="mt-1.5 border-t border-zinc-800/70 pt-1.5 text-[11px] leading-relaxed text-zinc-600">Observations are sampled about every 60 seconds by one shared scheduler. Quotes are kept 7 days, events 30 days — older gaps are labelled as coverage gaps. Market open/closed is a weekday ET approximation; holidays and early closes aren&apos;t modelled.</p>
           </div>
         </div>

@@ -34,3 +34,5 @@ body {
     transition-duration: 0.01ms !important;
   }
 }
+
+html { font-size: 16px; }
