@@ -6,7 +6,7 @@ import type { User, Watchlist, WatchlistItem, QuoteSnapshot, ChangeEvent } from 
 import { scoreQuote, buildSummary, eventFingerprint, THRESHOLD, SCORE_VERSION, type ScoredResult } from "./score";
 
 const DATA_DIR = process.env.SW_DATA_DIR || path.join(process.cwd(), ".data");
-const DB_PATH = process.env.SW_DB_PATH || path.join(DATA_DIR, "watchlist.sqlite");
+export const DB_PATH = process.env.SW_DB_PATH || path.join(DATA_DIR, "watchlist.sqlite");
 const LEGACY_PATH = path.join(DATA_DIR, "db.json");
 
 export const LIVE_NS = "live";
@@ -179,6 +179,14 @@ function migrateSchema(h: DatabaseSync): void {
       h.exec("ALTER TABLE quotes ADD COLUMN as_of_source TEXT NOT NULL DEFAULT 'provider'");
     }
   }
+  const icols = new Set((h.prepare("PRAGMA table_info(items)").all() as {name:string}[]).map(c=>c.name));
+  if (!icols.has("event_floor")) h.exec("ALTER TABLE items ADD COLUMN event_floor INTEGER NOT NULL DEFAULT 0");
+  const bcols = new Set((h.prepare("PRAGMA table_info(item_baselines)").all() as { name: string }[]).map(c => c.name));
+  if (!bcols.has("source")) {
+    h.exec("ALTER TABLE item_baselines ADD COLUMN source TEXT; ALTER TABLE item_baselines ADD COLUMN membership_id TEXT;");
+    h.exec(`UPDATE item_baselines SET source = (SELECT source FROM quotes WHERE id = item_baselines.quote_id),
+      membership_id = (SELECT id FROM items WHERE watchlist_id = item_baselines.watchlist_id AND symbol = item_baselines.symbol)`);
+  }
   const scol = new Set(
     (h.prepare("PRAGMA table_info(symbol_samples)").all() as unknown as { name: string }[]).map((c) => c.name)
   );
@@ -315,7 +323,7 @@ export function itemAddedAt(watchlistId: string, symbol: string): string | null 
 
 /** INSERT OR IGNORE — returns true when a new row was created. Safe under concurrency. */
 export function addItem(watchlistId: string, symbol: string, at = nowISO()): { created: boolean } {
-  const r = db().prepare("INSERT OR IGNORE INTO items(id, watchlist_id, symbol, added_at) VALUES (?,?,?,?)")
+  const r = db().prepare("INSERT OR IGNORE INTO items(id, watchlist_id, symbol, added_at, event_floor) VALUES (?,?,?,?,(SELECT COALESCE(MAX(id),0) FROM events))")
     .run(uid(), watchlistId, symbol, at);
   return { created: Number(r.changes) === 1 };
 }
@@ -336,8 +344,7 @@ export function removeItem(watchlistId: string, userId: string, symbol: string):
 /** Symbols needing live ingestion: items in real watchlists + live-quoted symbols. */
 export function liveSymbols(): string[] {
   const rows = db().prepare(
-    `SELECT symbol FROM items i JOIN watchlists w ON w.id = i.watchlist_id WHERE w.is_demo = 0
-     UNION SELECT DISTINCT symbol FROM quotes WHERE namespace = 'live'`
+    `SELECT DISTINCT symbol FROM items i JOIN watchlists w ON w.id = i.watchlist_id WHERE w.is_demo = 0`
   ).all() as unknown as { symbol: string }[];
   return rows.map((r) => r.symbol);
 }
@@ -495,13 +502,13 @@ export interface StoreResult {
 
 export interface FetchStatus {
   attemptAt: string; provider: string; outcome: "accepted" | "duplicate" | "rejected" | "error";
-  providerAsOf: string | null; reason: string | null;
+  providerAsOf: string | null; reason: string | null; lastSuccessAt?: string | null; httpStatus?: number; price?: number;
 }
 
 /** Per-symbol fetch health, separate from observation time. Bounded to watched symbols. */
 export function recordFetch(namespace: string, symbol: string, s: FetchStatus): void {
   db().prepare("INSERT INTO meta(key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
-    .run(`fetch:${namespace}:${symbol}`, JSON.stringify(s));
+    .run(`fetch:${namespace}:${symbol}`, JSON.stringify({ ...s, lastSuccessAt: s.outcome === "accepted" || s.outcome === "duplicate" ? s.attemptAt : fetchStatus(namespace, symbol)?.lastSuccessAt ?? null }));
 }
 
 export function fetchStatus(namespace: string, symbol: string): FetchStatus | null {
@@ -535,6 +542,11 @@ export function scoreAndStore(namespace: string, obs: Observation): StoreResult 
       && Number(prev.price) === obs.price && (prev.volume ?? null) === (obs.volume ?? null)) {
       return { accepted: false, duplicate: true, reason: "duplicate observation" };
     }
+    if (prev && obs.asOf === prev.as_of) return { accepted: false, reason: "conflicting observation at existing provider timestamp" };
+    let transitioned = false;
+    if (obs.source === "finnhub" && namespace === LIVE_NS && !prev && hasSimHistory(h, namespace, obs.symbol)) {
+      transitioned = transitionSymbolLive(h, namespace, obs.symbol, nowISO());
+    }
     const prevPrice = prev ? Number(prev.price) : null;
     const base = readBaseline(namespace, obs.symbol);
     const hist = recentQuotes(namespace, obs.symbol, 7, obs.source).map((x) => Number(x.price));
@@ -549,15 +561,6 @@ export function scoreAndStore(namespace: string, obs: Observation): StoreResult 
       as_of: obs.asOf, fetched_at: obs.fetchedAt, source: obs.source,
       prev_close: obs.prevClose, delay_sec: obs.delaySec, as_of_source: obs.asOfSource,
     });
-    // First real-provider acceptance alongside simulated history: reset
-    // statistics to this stream, invalidate simulated review baselines, and
-    // record the transition. Simulated quotes stay preserved, just unscored.
-    let transitioned = false;
-    if (obs.source === "finnhub" && namespace === LIVE_NS && !hasSourceHistoryBefore(h, namespace, obs.symbol, quoteId)) {
-      if (hasSimHistory(h, namespace, obs.symbol)) {
-        transitioned = transitionSymbolLive(h, namespace, obs.symbol, obs.asOf);
-      }
-    }
     // Statistics follow the display stream only: once real observations
     // exist, simulated rows are preserved but never feed real scoring.
     if (displaySource(namespace, obs.symbol) === obs.source) {
@@ -591,12 +594,6 @@ export function scoreAndStore(namespace: string, obs: Observation): StoreResult 
     }
     return { accepted: true, quoteId, scored, eventId, transitioned };
   });
-}
-
-function hasSourceHistoryBefore(h: DatabaseSync, namespace: string, symbol: string, excludeQuoteId: number): boolean {
-  const row = h.prepare("SELECT 1 AS x FROM quotes WHERE namespace = ? AND symbol = ? AND source = 'finnhub' AND id != ? LIMIT 1")
-    .get(namespace, symbol, excludeQuoteId) as { x: number } | undefined;
-  return !!row;
 }
 
 function hasSimHistory(h: DatabaseSync, namespace: string, symbol: string): boolean {
@@ -672,11 +669,12 @@ export function unreadEvents(namespace: string, watchlistId: string, userId: str
   const placeholders = symbols.map(() => "?").join(",");
   // Membership-start filtering happens inside SQL, BEFORE sorting/limiting,
   // so pre-addition events can never consume briefing slots.
-  const args: SQLInputValue[] = [watchlistId, userId, namespace, ...symbols, tr.tracking_since, watchlistId, limit];
+  const args: SQLInputValue[] = [watchlistId, userId, namespace, ...symbols, tr.tracking_since, watchlistId, watchlistId, limit];
   return h.prepare(`SELECT e.* FROM events e
     LEFT JOIN reviewed_events r ON r.event_id = e.id AND r.watchlist_id = ? AND r.user_id = ?
     WHERE e.namespace = ? AND e.symbol IN (${placeholders}) AND e.occurred_at >= ?
       AND e.occurred_at >= (SELECT added_at FROM items WHERE watchlist_id = ? AND symbol = e.symbol)
+      AND e.id > (SELECT event_floor FROM items WHERE watchlist_id = ? AND symbol = e.symbol)
       AND r.event_id IS NULL
     ORDER BY e.score DESC LIMIT ?`).all(...args) as unknown as StoredEvent[];
 }
@@ -699,9 +697,9 @@ export function lastReviewedAt(watchlistId: string, userId: string): string | nu
   return row?.reviewed_at ?? null;
 }
 
-export function baselineFor(watchlistId: string, userId: string, symbol: string): { price: number; as_of: string } | null {
-  const row = db().prepare("SELECT price, as_of FROM item_baselines WHERE watchlist_id = ? AND user_id = ? AND symbol = ?")
-    .get(watchlistId, userId, symbol) as { price: number; as_of: string } | undefined;
+export function baselineFor(watchlistId: string, userId: string, symbol: string): { price: number; as_of: string; source: string; membership_id: string } | null {
+  const row = db().prepare(`SELECT b.price, b.as_of, b.source, b.membership_id FROM item_baselines b JOIN items i ON i.id = b.membership_id JOIN watchlists w ON w.id = i.watchlist_id WHERE b.watchlist_id = ? AND b.user_id = ? AND b.symbol = ? AND b.source = COALESCE((SELECT source FROM quotes WHERE namespace = CASE WHEN w.is_demo = 1 THEN 'demo:' || w.user_id ELSE 'live' END AND symbol = b.symbol ORDER BY (source = 'finnhub') DESC, as_of DESC, id DESC LIMIT 1), 'unknown')`)
+    .get(watchlistId, userId, symbol) as { price: number; as_of: string; source: string; membership_id: string } | undefined;
   return row ?? null;
 }
 
@@ -711,21 +709,27 @@ export function startTracking(watchlistId: string, userId: string, namespace: st
     const now = at;
     h.prepare("INSERT INTO reviews(watchlist_id, user_id, tracking_since, reviewed_at) VALUES (?,?,?,?) ON CONFLICT(watchlist_id, user_id) DO UPDATE SET reviewed_at=excluded.reviewed_at")
       .run(watchlistId, userId, now, now);
-    const ib = h.prepare("INSERT INTO item_baselines(watchlist_id, user_id, symbol, price, quote_id, as_of) VALUES (?,?,?,?,?,?) ON CONFLICT(watchlist_id, user_id, symbol) DO UPDATE SET price=excluded.price, quote_id=excluded.quote_id, as_of=excluded.as_of");
+    const ib = h.prepare("INSERT INTO item_baselines(watchlist_id, user_id, symbol, price, quote_id, as_of, source, membership_id) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(watchlist_id, user_id, symbol) DO UPDATE SET price=excluded.price, quote_id=excluded.quote_id, as_of=excluded.as_of, source=excluded.source, membership_id=excluded.membership_id WHERE excluded.source != item_baselines.source OR excluded.as_of >= item_baselines.as_of OR item_baselines.source IS NULL");
     for (const s of symbols) {
-      const q = h.prepare("SELECT id, price, as_of FROM quotes WHERE namespace = ? AND symbol = ? ORDER BY as_of DESC, id DESC LIMIT 1")
-        .get(namespace, s) as { id: number; price: number; as_of: string } | undefined;
-      if (q) ib.run(watchlistId, userId, s, q.price, q.id, q.as_of);
+      const q = displayQuote(namespace, s);
+      const member = itemsFor(watchlistId).find(i => i.symbol === s);
+      if (q && member) ib.run(watchlistId, userId, s, q.price, q.id, q.as_of, q.source, member.id);
     }
     return now;
   });
 }
 
-export interface SnapshotBaseline { price: number; asOf: string; addedAt: string; source?: string }
+export interface SnapshotBaseline { price: number; asOf: string; addedAt: string; source?: string; membershipId?: string }
 
 export interface BriefingSnapshot { token: string; eventIds: number[]; baselines: Record<string, SnapshotBaseline> }
 
 export function createSnapshot(watchlistId: string, userId: string, eventIds: number[], baselines: Record<string, SnapshotBaseline>): string {
+  const members = itemsFor(watchlistId);
+  const wl = getOwnedWatchlist(userId, watchlistId);
+  for (const [symbol, b] of Object.entries(baselines)) {
+    b.membershipId ??= members.find(i => i.symbol === symbol)?.id;
+    b.source ??= displaySource(wl?.is_demo ? demoNs(userId) : LIVE_NS, symbol);
+  }
   const token = uid();
   db().prepare("INSERT INTO briefing_snapshots(token, watchlist_id, user_id, event_ids, baselines, created_at) VALUES (?,?,?,?,?,?)")
     .run(token, watchlistId, userId, JSON.stringify(eventIds), JSON.stringify(baselines), nowISO());
@@ -759,24 +763,22 @@ export function ackSnapshot(userId: string, watchlistId: string, token: string, 
     const ri = h.prepare("INSERT OR IGNORE INTO reviewed_events(watchlist_id, user_id, event_id, reviewed_at) VALUES (?,?,?,?)");
     let fresh = 0;
     for (const id of ids) fresh += Number(ri.run(watchlistId, userId, id, now).changes);
-    const cur = h.prepare("SELECT symbol, added_at FROM items WHERE watchlist_id = ?")
-      .all(watchlistId) as unknown as { symbol: string; added_at: string }[];
+    const cur = h.prepare("SELECT id, symbol, added_at FROM items WHERE watchlist_id = ?")
+      .all(watchlistId) as unknown as { id: string; symbol: string; added_at: string }[];
     const addedAt = new Map(cur.map((r) => [r.symbol, r.added_at]));
-    const ib = h.prepare(`INSERT INTO item_baselines(watchlist_id, user_id, symbol, price, quote_id, as_of) VALUES (?,?,?,?,NULL,?)
-      ON CONFLICT(watchlist_id, user_id, symbol) DO UPDATE SET
-      price=CASE WHEN excluded.as_of >= item_baselines.as_of THEN excluded.price ELSE item_baselines.price END,
-      as_of=CASE WHEN excluded.as_of >= item_baselines.as_of THEN excluded.as_of ELSE item_baselines.as_of END,
-      quote_id=CASE WHEN excluded.as_of >= item_baselines.as_of THEN NULL ELSE item_baselines.quote_id END`);
+    const ib = h.prepare(`INSERT INTO item_baselines(watchlist_id,user_id,symbol,price,quote_id,as_of,source,membership_id) VALUES (?,?,?,?,NULL,?,?,?)
+      ON CONFLICT(watchlist_id,user_id,symbol) DO UPDATE SET price=excluded.price,quote_id=NULL,as_of=excluded.as_of,source=excluded.source,membership_id=excluded.membership_id
+      WHERE item_baselines.source IS NULL OR item_baselines.source != excluded.source OR excluded.as_of >= item_baselines.as_of`);
     const wlRow = h.prepare("SELECT is_demo FROM watchlists WHERE id = ?").get(watchlistId) as { is_demo: number } | undefined;
     const ackNs = wlRow && wlRow.is_demo ? demoNs(userId) : LIVE_NS;
     for (const [sym, b] of Object.entries(baselines)) {
       // Skip baselines for absent items or earlier membership periods.
       const cur = addedAt.get(sym);
-      if (cur == null || cur > b.addedAt) continue;
+      if (cur == null || cur !== b.addedAt || !b.membershipId || !itemsFor(watchlistId).some(i => i.id === b.membershipId && i.symbol === sym)) continue;
       // Skip baselines from a previous source generation: a simulated price
       // must never become the baseline for real-provider changes.
-      if (b.source && displaySource(ackNs, sym) !== b.source) continue;
-      ib.run(watchlistId, userId, sym, b.price, b.asOf);
+      if (!b.source || displaySource(ackNs, sym) !== b.source) continue;
+      ib.run(watchlistId, userId, sym, b.price, b.asOf, b.source, b.membershipId);
     }
     h.prepare("UPDATE reviews SET reviewed_at = ? WHERE watchlist_id = ? AND user_id = ?").run(now, watchlistId, userId);
     // Snapshot rows are retained so repeating an acknowledgement is a
@@ -800,6 +802,7 @@ export function collapseDuplicateObservations(): { quotes: number; events: numbe
     const dupQ = h.prepare(`SELECT namespace, symbol, source, as_of, MIN(id) AS keep, COUNT(*) AS n
       FROM quotes GROUP BY namespace, symbol, source, as_of HAVING n > 1`).all() as unknown as
       { namespace: string; symbol: string; source: string; as_of: string; keep: number; n: number }[];
+    const backupRows = { quotes: h.prepare("SELECT * FROM quotes").all(), scores: h.prepare("SELECT * FROM quote_scores").all(), events: h.prepare("SELECT * FROM events").all(), reviewed: h.prepare("SELECT * FROM reviewed_events").all(), baselines: h.prepare("SELECT * FROM item_baselines").all(), samples: h.prepare("SELECT * FROM symbol_samples").all() };
     let quotes = 0;
     const removedQuotes: number[] = [];
     for (const g of dupQ) {
@@ -807,6 +810,7 @@ export function collapseDuplicateObservations(): { quotes: number; events: numbe
         .all(g.namespace, g.symbol, g.source, g.as_of, g.keep) as unknown as { id: number }[];
       for (const r of ids) {
         h.prepare("DELETE FROM quote_scores WHERE namespace = ? AND symbol = ? AND quote_id = ?").run(g.namespace, g.symbol, r.id);
+        h.prepare("UPDATE item_baselines SET quote_id = ? WHERE quote_id = ?").run(g.keep, r.id);
         h.prepare("DELETE FROM quotes WHERE id = ?").run(r.id);
         removedQuotes.push(r.id);
         quotes += 1;
@@ -821,6 +825,7 @@ export function collapseDuplicateObservations(): { quotes: number; events: numbe
       const ids = h.prepare("SELECT id FROM events WHERE namespace = ? AND symbol = ? AND fingerprint = ? AND occurred_at = ? AND id != ? ORDER BY id")
         .all(g.namespace, g.symbol, g.fingerprint, g.occurred_at, g.keep) as unknown as { id: number }[];
       for (const r of ids) {
+        h.prepare("INSERT OR IGNORE INTO reviewed_events(watchlist_id,user_id,event_id,reviewed_at) SELECT watchlist_id,user_id,?,reviewed_at FROM reviewed_events WHERE event_id = ?").run(g.keep,r.id);
         h.prepare("DELETE FROM reviewed_events WHERE event_id = ?").run(r.id);
         h.prepare("DELETE FROM events WHERE id = ?").run(r.id);
         removedEvents.push(r.id);
@@ -828,7 +833,7 @@ export function collapseDuplicateObservations(): { quotes: number; events: numbe
       }
     }
     const backupKey = `dedupe_backup:${nowISO()}`;
-    setMetaOn(h, backupKey, JSON.stringify({ at: nowISO(), quotes: removedQuotes, events: removedEvents }));
+    setMetaOn(h, backupKey, JSON.stringify({ at: nowISO(), ...backupRows, removedQuotes, removedEvents }));
     // Symbols that already hold real-provider history move to real-provider
     // statistics now (same transition as first acceptance): simulated-derived
     // samples and simulated-era baselines are dropped, never blended.
