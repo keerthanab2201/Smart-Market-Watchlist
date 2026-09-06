@@ -1,5 +1,5 @@
 import {
-  liveSymbols, setMeta, getMetaValue, scoreAndStore, pruneRetention, LIVE_NS,
+  liveSymbols, setMeta, getMetaValue, scoreAndStore, pruneRetention, recordFetch, LIVE_NS,
 } from "./db";
 import { getProvider, validateQuote, type MarketDataProvider } from "./market";
 
@@ -61,15 +61,29 @@ async function runIngestInner(namespace: string, provider?: MarketDataProvider):
   let events = 0;
   let rejected = 0;
   for (const symbol of symbols) {
+    // Fetch health is recorded per symbol per attempt, separately from the
+    // observation timestamp: a repeated identical session quote is a
+    // successful fetch that simply needs no new observation.
+    const attemptAt = nowISO();
     try {
       const q = await prov.getQuote(symbol);
       const v = validateQuote(q);
-      if (!v.ok) { rejected += 1; noteRejection(symbol, v.reason); continue; }
+      if (!v.ok) {
+        rejected += 1;
+        noteRejection(symbol, v.reason);
+        recordFetch(namespace, symbol, { attemptAt, provider: prov.kind, outcome: "error", providerAsOf: null, reason: v.reason });
+        continue;
+      }
       const res = scoreAndStore(namespace, {
         symbol, price: q.price, volume: q.volume,
         asOf: q.asOf.toISOString(), fetchedAt: nowISO(), source: q.source,
         prevClose: q.prevClose, delaySec: q.delaySec,
         asOfSource: q.asOfSource ?? "provider",
+      });
+      recordFetch(namespace, symbol, {
+        attemptAt, provider: prov.kind,
+        outcome: res.accepted ? "accepted" : res.duplicate ? "duplicate" : "rejected",
+        providerAsOf: q.asOf.toISOString(), reason: res.accepted ? null : (res.reason ?? null),
       });
       if (!res.accepted) {
         // Duplicates are idempotent silence; stale timestamps are quarantined.
@@ -77,8 +91,12 @@ async function runIngestInner(namespace: string, provider?: MarketDataProvider):
         continue;
       }
       if (res.eventId != null) events += 1;
-    } catch {
+    } catch (e) {
       noteRejection(symbol, "provider error");
+      recordFetch(namespace, symbol, {
+        attemptAt, provider: prov.kind, outcome: "error", providerAsOf: null,
+        reason: e instanceof Error ? e.message.slice(0, 120) : "provider error",
+      });
       rejected += 1;
     }
   }

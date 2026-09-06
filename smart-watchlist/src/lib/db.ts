@@ -348,9 +348,32 @@ export function demoSymbols(namespace: string): string[] {
   return rows.map((r) => r.symbol);
 }
 
-export function latestQuote(namespace: string, symbol: string): QuoteSnapshot | undefined {
-  return db().prepare("SELECT * FROM quotes WHERE namespace = ? AND symbol = ? ORDER BY as_of DESC, id DESC LIMIT 1")
-    .get(namespace, symbol) as QuoteSnapshot | undefined;
+export function latestQuote(namespace: string, symbol: string, source?: string): QuoteSnapshot | undefined {
+  return source == null
+    ? db().prepare("SELECT * FROM quotes WHERE namespace = ? AND symbol = ? ORDER BY as_of DESC, id DESC LIMIT 1")
+      .get(namespace, symbol) as QuoteSnapshot | undefined
+    : db().prepare("SELECT * FROM quotes WHERE namespace = ? AND symbol = ? AND source = ? ORDER BY as_of DESC, id DESC LIMIT 1")
+      .get(namespace, symbol, source) as QuoteSnapshot | undefined;
+}
+
+/**
+ * Display preference: a real-provider observation supersedes simulated ones
+ * even when its timestamp is earlier. Simulated history is preserved, just
+ * not shown once real data exists. Never falls back silently: the choice is
+ * deterministic from stored provenance.
+ */
+export function displayQuote(namespace: string, symbol: string): QuoteSnapshot | undefined {
+  return latestQuote(namespace, symbol, "finnhub") ?? latestQuote(namespace, symbol);
+}
+
+export function displaySource(namespace: string, symbol: string): string {
+  return displayQuote(namespace, symbol)?.source ?? "unknown";
+}
+
+export function hasSourceHistory(namespace: string, symbol: string, source: string): boolean {
+  const row = db().prepare("SELECT 1 AS x FROM quotes WHERE namespace = ? AND symbol = ? AND source = ? LIMIT 1")
+    .get(namespace, symbol, source) as { x: number } | undefined;
+  return !!row;
 }
 
 export function recentQuotes(namespace: string, symbol: string, n: number, source?: string): QuoteSnapshot[] {
@@ -467,6 +490,28 @@ export interface Observation {
 export interface StoreResult {
   accepted: boolean; duplicate?: boolean; reason?: string;
   quoteId?: number; scored?: ScoredResult; eventId?: number;
+  transitioned?: boolean;
+}
+
+export interface FetchStatus {
+  attemptAt: string; provider: string; outcome: "accepted" | "duplicate" | "rejected" | "error";
+  providerAsOf: string | null; reason: string | null;
+}
+
+/** Per-symbol fetch health, separate from observation time. Bounded to watched symbols. */
+export function recordFetch(namespace: string, symbol: string, s: FetchStatus): void {
+  db().prepare("INSERT INTO meta(key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+    .run(`fetch:${namespace}:${symbol}`, JSON.stringify(s));
+}
+
+export function fetchStatus(namespace: string, symbol: string): FetchStatus | null {
+  const row = db().prepare("SELECT value FROM meta WHERE key = ?").get(`fetch:${namespace}:${symbol}`) as { value: string } | undefined;
+  if (!row) return null;
+  try {
+    return JSON.parse(row.value) as FetchStatus;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -477,18 +522,22 @@ export interface StoreResult {
  * first, then commit (so failures never leave partial state).
  */
 export function scoreAndStore(namespace: string, obs: Observation): StoreResult {
-  return tx(() => {
-    const prev = latestQuote(namespace, obs.symbol);
+  return tx((h) => {
+    // Ordering and duplicates are judged WITHIN this observation's source
+    // stream: a valid earlier-dated real-provider session quote must be able
+    // to supersede a newer simulated quote, while out-of-order observations
+    // from the same stream stay rejected.
+    const prev = latestQuote(namespace, obs.symbol, obs.source);
     if (prev && obs.asOf < prev.as_of) {
-      return { accepted: false, reason: "older timestamp than latest accepted observation" };
+      return { accepted: false, reason: `older timestamp than latest accepted ${obs.source} observation` };
     }
-    if (prev && obs.asOf === prev.as_of) {
+    if (prev && obs.asOf === prev.as_of
+      && Number(prev.price) === obs.price && (prev.volume ?? null) === (obs.volume ?? null)) {
       return { accepted: false, duplicate: true, reason: "duplicate observation" };
     }
     const prevPrice = prev ? Number(prev.price) : null;
     const base = readBaseline(namespace, obs.symbol);
-    const source = prev?.source ?? obs.source;
-    const hist = recentQuotes(namespace, obs.symbol, 7, source).map((x) => Number(x.price));
+    const hist = recentQuotes(namespace, obs.symbol, 7, obs.source).map((x) => Number(x.price));
     const closes = [...hist, obs.price];
     const scored = scoreQuote({
       price: obs.price, prevPrice, volume: obs.volume ?? 0,
@@ -500,7 +549,20 @@ export function scoreAndStore(namespace: string, obs: Observation): StoreResult 
       as_of: obs.asOf, fetched_at: obs.fetchedAt, source: obs.source,
       prev_close: obs.prevClose, delay_sec: obs.delaySec, as_of_source: obs.asOfSource,
     });
-    observeSample(namespace, obs.symbol, obs.price, obs.volume, prevPrice);
+    // First real-provider acceptance alongside simulated history: reset
+    // statistics to this stream, invalidate simulated review baselines, and
+    // record the transition. Simulated quotes stay preserved, just unscored.
+    let transitioned = false;
+    if (obs.source === "finnhub" && namespace === LIVE_NS && !hasSourceHistoryBefore(h, namespace, obs.symbol, quoteId)) {
+      if (hasSimHistory(h, namespace, obs.symbol)) {
+        transitioned = transitionSymbolLive(h, namespace, obs.symbol, obs.asOf);
+      }
+    }
+    // Statistics follow the display stream only: once real observations
+    // exist, simulated rows are preserved but never feed real scoring.
+    if (displaySource(namespace, obs.symbol) === obs.source) {
+      observeSample(namespace, obs.symbol, obs.price, obs.volume, prevPrice);
+    }
     storeScore(namespace, obs.symbol, quoteId, {
       score: scored.total, components: JSON.stringify(scored.components),
       missing: JSON.stringify(scored.missing), version: scored.version,
@@ -527,8 +589,53 @@ export function scoreAndStore(namespace: string, obs: Observation): StoreResult 
         });
       }
     }
-    return { accepted: true, quoteId, scored, eventId };
+    return { accepted: true, quoteId, scored, eventId, transitioned };
   });
+}
+
+function hasSourceHistoryBefore(h: DatabaseSync, namespace: string, symbol: string, excludeQuoteId: number): boolean {
+  const row = h.prepare("SELECT 1 AS x FROM quotes WHERE namespace = ? AND symbol = ? AND source = 'finnhub' AND id != ? LIMIT 1")
+    .get(namespace, symbol, excludeQuoteId) as { x: number } | undefined;
+  return !!row;
+}
+
+function hasSimHistory(h: DatabaseSync, namespace: string, symbol: string): boolean {
+  const row = h.prepare("SELECT 1 AS x FROM quotes WHERE namespace = ? AND symbol = ? AND source = 'simulated' LIMIT 1")
+    .get(namespace, symbol) as { x: number } | undefined;
+  return !!row;
+}
+
+/** Has this symbol already been moved to real-provider statistics? */
+export function isTransitioned(namespace: string, symbol: string): boolean {
+  return getMeta(db(), `transition:${namespace}:${symbol}`) != null;
+}
+
+/**
+ * Move a symbol to real-provider statistics: drop simulated-derived samples
+ * and simulated-era review baselines, record the transition. Simulated quotes
+ * and events are preserved untouched. Idempotent via the transition marker.
+ */
+export function transitionSymbolLive(h: DatabaseSync, namespace: string, symbol: string, at: string): boolean {
+  if (getMeta(h, `transition:${namespace}:${symbol}`) != null) return false;
+  h.prepare("DELETE FROM symbol_samples WHERE namespace = ? AND symbol = ?").run(namespace, symbol);
+  h.prepare(`DELETE FROM item_baselines WHERE symbol = ? AND watchlist_id IN
+    (SELECT id FROM watchlists WHERE is_demo = 0)`).run(symbol);
+  setMetaOn(h, `transition:${namespace}:${symbol}`, JSON.stringify({ at, from: "simulated", to: "finnhub" }));
+  return true;
+}
+export function sourceTransitions(namespace: string, symbols: string[]): { symbol: string; at: string; from: string; to: string }[] {
+  const h = db();
+  const out: { symbol: string; at: string; from: string; to: string }[] = [];
+  for (const s of symbols) {
+    const raw = h.prepare("SELECT value FROM meta WHERE key = ?").get(`transition:${namespace}:${s}`) as { value: string } | undefined;
+    if (raw) {
+      try {
+        const v = JSON.parse(raw.value) as { at: string; from: string; to: string };
+        out.push({ symbol: s, ...v });
+      } catch { /* ignore corrupt marker */ }
+    }
+  }
+  return out;
 }
 
 // ---- events ----
@@ -614,9 +721,11 @@ export function startTracking(watchlistId: string, userId: string, namespace: st
   });
 }
 
-export interface BriefingSnapshot { token: string; eventIds: number[]; baselines: Record<string, { price: number; asOf: string; addedAt: string }> }
+export interface SnapshotBaseline { price: number; asOf: string; addedAt: string; source?: string }
 
-export function createSnapshot(watchlistId: string, userId: string, eventIds: number[], baselines: Record<string, { price: number; asOf: string; addedAt: string }>): string {
+export interface BriefingSnapshot { token: string; eventIds: number[]; baselines: Record<string, SnapshotBaseline> }
+
+export function createSnapshot(watchlistId: string, userId: string, eventIds: number[], baselines: Record<string, SnapshotBaseline>): string {
   const token = uid();
   db().prepare("INSERT INTO briefing_snapshots(token, watchlist_id, user_id, event_ids, baselines, created_at) VALUES (?,?,?,?,?,?)")
     .run(token, watchlistId, userId, JSON.stringify(eventIds), JSON.stringify(baselines), nowISO());
@@ -646,7 +755,7 @@ export function ackSnapshot(userId: string, watchlistId: string, token: string, 
     const snapIds = JSON.parse(snap.event_ids) as number[];
     const ids = onlyIds ? onlyIds.filter((id) => snapIds.includes(id)) : snapIds;
     if (onlyIds && ids.length !== onlyIds.length) throw new Error("briefing changed; refetch and retry");
-    const baselines = JSON.parse(snap.baselines) as Record<string, { price: number; asOf: string; addedAt: string }>;
+    const baselines = JSON.parse(snap.baselines) as Record<string, SnapshotBaseline>;
     const ri = h.prepare("INSERT OR IGNORE INTO reviewed_events(watchlist_id, user_id, event_id, reviewed_at) VALUES (?,?,?,?)");
     let fresh = 0;
     for (const id of ids) fresh += Number(ri.run(watchlistId, userId, id, now).changes);
@@ -658,10 +767,15 @@ export function ackSnapshot(userId: string, watchlistId: string, token: string, 
       price=CASE WHEN excluded.as_of >= item_baselines.as_of THEN excluded.price ELSE item_baselines.price END,
       as_of=CASE WHEN excluded.as_of >= item_baselines.as_of THEN excluded.as_of ELSE item_baselines.as_of END,
       quote_id=CASE WHEN excluded.as_of >= item_baselines.as_of THEN NULL ELSE item_baselines.quote_id END`);
+    const wlRow = h.prepare("SELECT is_demo FROM watchlists WHERE id = ?").get(watchlistId) as { is_demo: number } | undefined;
+    const ackNs = wlRow && wlRow.is_demo ? demoNs(userId) : LIVE_NS;
     for (const [sym, b] of Object.entries(baselines)) {
       // Skip baselines for absent items or earlier membership periods.
       const cur = addedAt.get(sym);
       if (cur == null || cur > b.addedAt) continue;
+      // Skip baselines from a previous source generation: a simulated price
+      // must never become the baseline for real-provider changes.
+      if (b.source && displaySource(ackNs, sym) !== b.source) continue;
       ib.run(watchlistId, userId, sym, b.price, b.asOf);
     }
     h.prepare("UPDATE reviews SET reviewed_at = ? WHERE watchlist_id = ? AND user_id = ?").run(now, watchlistId, userId);
@@ -672,6 +786,69 @@ export function ackSnapshot(userId: string, watchlistId: string, token: string, 
 }
 
 // ---- retention + health ----
+
+/**
+ * Explicit cleanup for observations duplicated by superseded ingestion code
+ * (no per-stream ordering guard). Collapses rows sharing
+ * (namespace, symbol, source, as_of), keeping the earliest id, and collapses
+ * same-fingerprint/same-time events the same way. Removed ids are backed up
+ * in meta before deletion; reviewed refs are re-pointed, never orphaned.
+ * Safe to re-run: second pass finds nothing.
+ */
+export function collapseDuplicateObservations(): { quotes: number; events: number; backupKey: string } {
+  return tx((h) => {
+    const dupQ = h.prepare(`SELECT namespace, symbol, source, as_of, MIN(id) AS keep, COUNT(*) AS n
+      FROM quotes GROUP BY namespace, symbol, source, as_of HAVING n > 1`).all() as unknown as
+      { namespace: string; symbol: string; source: string; as_of: string; keep: number; n: number }[];
+    let quotes = 0;
+    const removedQuotes: number[] = [];
+    for (const g of dupQ) {
+      const ids = h.prepare("SELECT id FROM quotes WHERE namespace = ? AND symbol = ? AND source = ? AND as_of = ? AND id != ? ORDER BY id")
+        .all(g.namespace, g.symbol, g.source, g.as_of, g.keep) as unknown as { id: number }[];
+      for (const r of ids) {
+        h.prepare("DELETE FROM quote_scores WHERE namespace = ? AND symbol = ? AND quote_id = ?").run(g.namespace, g.symbol, r.id);
+        h.prepare("DELETE FROM quotes WHERE id = ?").run(r.id);
+        removedQuotes.push(r.id);
+        quotes += 1;
+      }
+    }
+    const dupE = h.prepare(`SELECT namespace, symbol, fingerprint, occurred_at, MIN(id) AS keep, COUNT(*) AS n
+      FROM events GROUP BY namespace, symbol, fingerprint, occurred_at HAVING n > 1`).all() as unknown as
+      { namespace: string; symbol: string; fingerprint: string; occurred_at: string; keep: number; n: number }[];
+    let events = 0;
+    const removedEvents: number[] = [];
+    for (const g of dupE) {
+      const ids = h.prepare("SELECT id FROM events WHERE namespace = ? AND symbol = ? AND fingerprint = ? AND occurred_at = ? AND id != ? ORDER BY id")
+        .all(g.namespace, g.symbol, g.fingerprint, g.occurred_at, g.keep) as unknown as { id: number }[];
+      for (const r of ids) {
+        h.prepare("DELETE FROM reviewed_events WHERE event_id = ?").run(r.id);
+        h.prepare("DELETE FROM events WHERE id = ?").run(r.id);
+        removedEvents.push(r.id);
+        events += 1;
+      }
+    }
+    const backupKey = `dedupe_backup:${nowISO()}`;
+    setMetaOn(h, backupKey, JSON.stringify({ at: nowISO(), quotes: removedQuotes, events: removedEvents }));
+    // Symbols that already hold real-provider history move to real-provider
+    // statistics now (same transition as first acceptance): simulated-derived
+    // samples and simulated-era baselines are dropped, never blended.
+    const transitioned: string[] = [];
+    const finSyms = h.prepare("SELECT DISTINCT symbol FROM quotes WHERE namespace = 'live' AND source = 'finnhub'")
+      .all() as unknown as { symbol: string }[];
+    for (const r of finSyms) {
+      if (hasSimHistory(h, LIVE_NS, r.symbol) && transitionSymbolLive(h, LIVE_NS, r.symbol, nowISO())) {
+        transitioned.push(r.symbol);
+      }
+    }
+    setMetaOn(h, "dedupe_migration", JSON.stringify({ status: "ok", at: nowISO(), quotes, events, backupKey, transitioned }));
+    return { quotes, events, backupKey };
+  });
+}
+
+export function dedupeStatus(): Record<string, unknown> {
+  const raw = getMeta(db(), "dedupe_migration");
+  return raw ? (JSON.parse(raw) as Record<string, unknown>) : { status: "never-run" };
+}
 
 export function pruneRetention(): { quotes: number; events: number } {
   const h = db();
