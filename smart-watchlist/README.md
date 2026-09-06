@@ -92,10 +92,25 @@ event → quiet tick. All timestamps injectable for tests.
 
 ## Data modes (always labelled)
 
-Simulated feed · Real provider (Finnhub, needs `FINNHUB_KEY`) · Delayed ·
-Stale · Unavailable · Demo (isolated per-user namespace). Simulated output is
+Simulated feed · Finnhub · Delayed · Stale · Unavailable · Demo (isolated per-user namespace). Simulated output is
 never presented as live. Switching live sources resets statistics and records
 the switch, so windows stay homogeneous.
+
+### Simulation → provider transition
+
+Each source has its own ordering stream: a valid earlier-dated provider
+session quote supersedes newer simulated rows for display, while out-of-order
+observations within one stream stay rejected. On first real acceptance the
+symbol's simulated-derived statistics and simulated-era review baselines are
+dropped (simulated quotes/events stay preserved), a transition is recorded,
+and the UI asks for a new review baseline. Old briefing tokens cannot restore
+previous-generation baselines. Pre-transition simulated events remain visible
+under "Earlier simulated signals", separate from real unread events.
+
+A configured key is required for live fetching; the running server's key and
+the `.env` value must agree (a stale `.env` takes effect only after restart).
+Without a working key the app keeps serving last-known-good quotes with
+explicit update-failure labels — never silently simulated prices.
 
 ## Known limitations
 

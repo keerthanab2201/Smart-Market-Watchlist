@@ -257,3 +257,31 @@ Backend fixes, all covered by tests in `../tests/` (43 passing: the original
   falling prices); header nav + intro + footer/About; drawer focus
   trap/restore with expandable breakdown; demo banner with Reset/Advance/
   Inject/Exit + next-step hints; exchange + added-state in search.
+
+---
+
+## 16. Real-data transition pass (2026-09-06)
+
+Diagnosis (live DB, production server on :3103): scheduler healthy, Finnhub
+selected, but AAPL/NVDA/TSLA fetches were rejected every minute as "older
+timestamp" — newer simulated rows blocked earlier-dated session quotes
+permanently. 44 identical Finnhub rows + 44 TSLA events per symbol had piled
+up from a superseded ingestion version without the older-than guard, and live
+statistics blended both sources (n_ret=59). The `.env` key returns 401 while
+the running server fetches successfully (process env predates the file) —
+restart without a working key stops live fetching entirely.
+
+Changes: per-source ordering/dedupe in `scoreAndStore` (identical repeats are
+idempotent; same-timestamp revisions accepted); display prefers the
+Finnhub stream with no silent fallback; transition resets stats, drops
+sim-era baselines, records a marker, and drives a re-baseline notice; old
+tokens can't restore previous-generation baselines; per-symbol fetch health
+separate from observation time; honest Last-session bounds (recent + closed
+only); "Insufficient history" replaces score-0 Normal; source-accurate
+badges ("Mixed data sources", Finnhub-only gating); ET wall-clock on the
+market pill; "Simulated session" in demo; explicit backed-up dedupe
+migration (`POST /api/migrate/cleanup`: 129 quotes + 52 events collapsed on
+the live DB); dev-only `GET /api/diag` (secret-gated in production, never
+exposes values). Tests: 54 passing incl. `tests/transition.test.mjs` (10
+scenarios). Requires rebuild + restart to go live; live Finnhub retrieval
+itself unverified (file key is 401).
