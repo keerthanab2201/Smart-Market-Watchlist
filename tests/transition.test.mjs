@@ -179,3 +179,49 @@ describe("legacy duplicate cleanup", () => {
     assert.equal(r2.events, 0);
   });
 });
+
+describe("review provenance regressions", () => {
+  it("explicit tracking selects Finnhub despite a newer simulated timestamp", () => {
+    const u=db.getOrCreateUser("real-baseline"); const w=db.ensureDefaultWatchlist(u.id);
+    db.scoreAndStore("live",simObs("TSLA",245.29,100,iso(T0+3600000)));
+    db.scoreAndStore("live",finnhubObs("TSLA",354.08,iso(T0)));
+    db.startTracking(w.id,u.id,"live",["TSLA"]);
+    const b=db.baselineFor(w.id,u.id,"TSLA");
+    assert.equal(b.price,354.08);assert.equal(b.source,"finnhub");
+    assert.equal(b.membership_id,db.itemsFor(w.id).find(i=>i.symbol==="TSLA").id);
+  });
+  it("first real score cannot use a mature simulated range", () => {
+    for(let i=0;i<9;i++)db.scoreAndStore("live",simObs("FIRST",100+i,1000,iso(T0+i*1000)));
+    const result=db.scoreAndStore("live",finnhubObs("FIRST",354,iso(T0-1000)));
+    const ev=JSON.parse(db.readScore("live","FIRST",result.quoteId).evidence);
+    assert.equal(ev.nRet,0);assert.equal(ev.rangeN,0);assert.equal(ev.rangeHi,null);
+  });
+  it("same-millisecond removal and re-add cannot restore an old token", () => {
+    const u=db.getOrCreateUser("membership-id"); const w=db.ensureDefaultWatchlist(u.id);const at=iso(T0);
+    db.addItem(w.id,"MEM",at);db.scoreAndStore("live",simObs("MEM",100,100,at));
+    const old=db.itemsFor(w.id).find(i=>i.symbol==="MEM").id;
+    const token=db.createSnapshot(w.id,u.id,[],{MEM:{price:100,asOf:at,addedAt:at}});
+    db.removeItem(w.id,u.id,"MEM");db.addItem(w.id,"MEM",at);db.ackSnapshot(u.id,w.id,token);
+    assert.notEqual(db.itemsFor(w.id).find(i=>i.symbol==="MEM").id,old);assert.equal(db.baselineFor(w.id,u.id,"MEM"),null);
+    assert.equal(db.recentQuotes("live","MEM",10).length,1);
+  });
+  it("conflicting payload at the same observation timestamp is rejected",()=>{
+    db.scoreAndStore("live",finnhubObs("CONFLICT",100,iso(T0)));
+    const r=db.scoreAndStore("live",finnhubObs("CONFLICT",101,iso(T0)));
+    assert.equal(r.accepted,false);assert.equal(db.recentQuotes("live","CONFLICT",20).length,1);
+  });
+  it("missing evidence and absent volume never claim normal trading",()=>{
+    assert.equal(fmt.describeEvidence({dayChangePct:0,missing:["volatility"],volRatio:null,source:"finnhub"}),"Not enough distinct observations to assess recent price behavior.");
+    assert.match(fmt.describeEvidence({dayChangePct:1,missing:[],volRatio:null,source:"finnhub"}),/Volume is not supplied by this feed/);
+  });
+  it("Friday quote remains last-session on Sunday; prior week is stale",()=>{
+    const now=new Date("2026-09-06T08:00:00Z").getTime();
+    assert.match(fmt.describeQuoteStatus(iso(T0),"finnhub",false,now).detail,/Last session/);
+    assert.equal(fmt.describeQuoteStatus(iso(T0-7*86400000),"finnhub",false,now).kind,"stale");
+  });
+  it("fetch failure preserves the last successful check",()=>{
+    db.recordFetch("live","HEALTH",{attemptAt:iso(T0),provider:"finnhub",outcome:"duplicate",providerAsOf:iso(T0),reason:null});
+    db.recordFetch("live","HEALTH",{attemptAt:iso(T0+1000),provider:"finnhub",outcome:"error",providerAsOf:null,reason:"failed"});
+    assert.equal(db.fetchStatus("live","HEALTH").lastSuccessAt,iso(T0));
+  });
+});
