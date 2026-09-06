@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --experimental-strip-types --import ../tests/register.mjs --test ../tests/score.test.mjs ../tests/db.test.mjs ../tests/review.test.mjs ../tests/demo.test.mjs ../tests/ingest.test.mjs ../tests/migration.test.mjs ../tests/ui.test.mjs",
+    "test": "node --experimental-strip-types --import ../tests/register.mjs --test ../tests/score.test.mjs ../tests/db.test.mjs ../tests/review.test.mjs ../tests/demo.test.mjs ../tests/ingest.test.mjs ../tests/migration.test.mjs ../tests/ui.test.mjs ../tests/transition.test.mjs",
     "test:http": "node ../tests/http.test.mjs"
   },
   "dependencies": {
