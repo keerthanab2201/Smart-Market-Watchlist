@@ -27,4 +27,5 @@ export interface EnrichedQuote {
   sinceReview: { pct: number; baselineAsOf: string } | null;
   quality: { kind: "simulated" | "live" | "delayed" | "stale" | "unavailable"; detail: string };
   version: number; currency: "USD" | "INR";
+  fetch: { attemptAt: string; outcome: string; providerAsOf: string | null; reason: string | null } | null;
 }

@@ -1,13 +1,13 @@
 import { NextResponse } from "next/server";
 import {
   db, tx, uid, nowISO, getOrCreateUser, ensureDefaultWatchlist, getOwnedWatchlist,
-  latestQuote, recentQuotes, readBaseline, readScore, deriveReasons,
+  displayQuote, recentQuotes, readBaseline, readScore, deriveReasons, fetchStatus,
 } from "@/lib/db";
 import { scoreQuote, buildSummary, THRESHOLD, SCORE_VERSION, type ScoredResult } from "@/lib/score";
 import { normalizeSymbol, VALID_SYMBOLS } from "@/lib/market";
 import { deviceToken, setDeviceCookie, isMarketOpen } from "@/lib/session";
 import { companyName, currencyFor } from "@/lib/companies";
-import { fmtSessionChange } from "@/lib/format";
+import { fmtSessionChange, describeQuoteStatus, timeAgo } from "@/lib/format";
 import type { EnrichedQuote, Watchlist } from "@/lib/types";
 
 export async function ctx() {
@@ -30,26 +30,29 @@ export function notFound() {
 }
 
 /** Approximate US-market schedule. Holidays and early closes are NOT modeled. */
-export function marketState(now = new Date()): { open: boolean; label: string; note: string } {
+export function marketState(now = new Date()): { open: boolean; label: string; note: string; etNow: string } {
   const open = isMarketOpen(now);
+  let etNow = "";
+  try {
+    etNow = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York", weekday: "short",
+      hour: "2-digit", minute: "2-digit", hour12: false,
+    }).format(now);
+  } catch {
+    etNow = "";
+  }
   return {
     open,
-    label: open ? "US market open (approx. schedule)" : "US market closed (approx. schedule)",
+    label: open ? "US market open" : "US market closed",
     note: "Weekday 9:30–16:00 ET approximation; holidays and early closes are not modeled.",
+    etNow: etNow ? `${etNow} ET` : "",
   };
 }
 
 const EMPTY_COMP = { surprise: 0, volume: 0, threshold: 0, reversal: 0 };
 
 export function qualityFor(source: string, asOf: string | null, marketOpen: boolean): EnrichedQuote["quality"] {
-  if (!asOf) return { kind: "unavailable", detail: "No accepted observations yet" };
-  const ageS = Math.max(0, (Date.now() - new Date(asOf).getTime()) / 1000);
-  const sim = source === "simulated" || source === "demo" || source === "legacy";
-  if (ageS > 600) return { kind: "stale", detail: `${sim ? "Simulated" : "Live"} data · last update ${Math.round(ageS / 60)}m ago` };
-  if (sim) return { kind: "simulated", detail: `Simulated data · updated ${ageS < 90 ? "just now" : `${Math.round(ageS / 60)}m ago`}` };
-  if (!marketOpen) return { kind: "delayed", detail: `Last session data · ${ageS < 90 ? "just now" : `${Math.round(ageS / 60)}m ago`}` };
-  if (ageS > 90) return { kind: "delayed", detail: `Delayed ${Math.round(ageS / 60)}m` };
-  return { kind: "live", detail: "Live" };
+  return describeQuoteStatus(asOf, source, marketOpen);
 }
 
 export type { Observation, StoreResult } from "@/lib/db";
@@ -62,9 +65,13 @@ export function enrich(symbols: string[], namespace: string, watchlistId: string
   const marketOpen = isMarketOpen();
   const h = db();
   return symbols.map((symbol): EnrichedQuote => {
-    const last = latestQuote(namespace, symbol);
-    // History follows the latest quote's source: simulated and real-provider
-    // observations are never blended into one window.
+    // Display prefers the real-provider stream: a valid earlier-dated
+    // session quote supersedes newer simulated rows. Simulated history is
+    // preserved but never shown once real data exists, and never restored
+    // silently after a provider failure.
+    const last = displayQuote(namespace, symbol);
+    // History follows the displayed quote's source: simulated and
+    // real-provider observations are never blended into one window.
     const hist = last ? recentQuotes(namespace, symbol, 8, last.source) : [];
     const closes = hist.map((x) => Number(x.price));
     const prev = hist.length >= 2 ? hist[hist.length - 2] : undefined;
@@ -117,6 +124,13 @@ export function enrich(symbols: string[], namespace: string, watchlistId: string
     const sessionChange = fmtSessionChange(last?.prev_close ?? null, price);
 
     const quality = qualityFor(last?.source ?? "", last?.as_of ?? null, marketOpen);
+    const fetch = fetchStatus(namespace, symbol);
+    if (last && last.source === "simulated" && fetch?.provider === "finnhub" && fetch.outcome === "error") {
+      quality.detail = `Previous simulated data · Finnhub update failed (${timeAgo(fetch.attemptAt)})`;
+    }
+    const fetchHealth = fetch
+      ? { attemptAt: fetch.attemptAt, outcome: fetch.outcome, providerAsOf: fetch.providerAsOf, reason: fetch.reason }
+      : null;
     return {
       symbol, price, prevClose: prevPrice,
       dayChangePct: ret != null ? ret * 100 : null,
@@ -134,6 +148,7 @@ export function enrich(symbols: string[], namespace: string, watchlistId: string
       chips: chips.slice(0, 3),
       company: companyName(symbol), source: last?.source ?? "unknown", asOf: last?.as_of ?? null,
       sinceReview, quality, version: SCORE_VERSION, currency: currencyFor(symbol),
+      fetch: fetchHealth,
     };
   });
 }

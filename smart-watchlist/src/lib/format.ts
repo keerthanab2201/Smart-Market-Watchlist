@@ -35,3 +35,44 @@ export function timeAgo(iso: string, nowMs = Date.now()): string {
   if (h < 24) return `${h}h ago`;
   return `${Math.floor(h / 24)}d ago`;
 }
+
+export type QuoteKind = "simulated" | "live" | "delayed" | "stale" | "unavailable";
+
+/**
+ * Quote status from observation age, session state, and source — pure and
+ * testable. "Last session" is claimed only for recent observations while the
+ * market is closed; older quotes are stale regardless of session.
+ */
+export function describeQuoteStatus(
+  asOf: string | null, source: string, marketOpen: boolean, nowMs = Date.now(),
+): { kind: QuoteKind; detail: string } {
+  if (!asOf) return { kind: "unavailable", detail: "No accepted observations yet" };
+  const ageS = Math.max(0, (nowMs - new Date(asOf).getTime()) / 1000);
+  const ago = ageS < 90 ? "just now" : `${Math.round(ageS / 60)}m ago`;
+  const sim = source === "simulated" || source === "demo" || source === "legacy";
+  if (ageS > 600) {
+    return {
+      kind: "stale",
+      detail: `${sim ? "Simulated data" : "Last update"} ${ago}${marketOpen ? "" : " (market closed)"}`,
+    };
+  }
+  if (sim) return { kind: "simulated", detail: `Simulated data · updated ${ago}` };
+  if (!marketOpen) {
+    // Recent quote while closed: plausibly the last session. Older quotes
+    // fall through to stale above (10-minute bound), never "last session".
+    return { kind: "delayed", detail: `Last session · observed ${ago}` };
+  }
+  if (ageS > 90) return { kind: "delayed", detail: `Delayed ${Math.round(ageS / 60)}m` };
+  return { kind: "live", detail: "Live" };
+}
+
+/**
+ * Score presentation: a zero with no scoring evidence is "Insufficient
+ * history", never "Normal". Missing evidence must not read as calm markets.
+ */
+export function scoreLabel(score: number, missing: string[]): string {
+  if (score === 0 && (missing.includes("baseline") || missing.includes("volatility"))) {
+    return "Insufficient history";
+  }
+  return String(score);
+}
