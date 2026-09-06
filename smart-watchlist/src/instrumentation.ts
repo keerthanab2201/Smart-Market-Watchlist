@@ -7,7 +7,7 @@
  * SQLite files; that topology needs PostgreSQL instead (schema maps 1:1).
  */
 export async function register() {
-  if (process.env.NEXT_RUNTIME === "nodejs") {
+  if (process.env.NEXT_RUNTIME === "nodejs" && process.env.SW_DISABLE_SCHEDULER !== "1") {
     const { ensureScheduler } = await import("./lib/shared");
     ensureScheduler();
   }

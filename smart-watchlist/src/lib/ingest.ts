@@ -49,12 +49,6 @@ async function runIngestInner(namespace: string, provider?: MarketDataProvider):
   // Never blend simulated and real-provider history: a source switch resets
   // live statistics and is recorded, so windows stay homogeneous.
   if (namespace === LIVE_NS) {
-    const { db } = await import("./db");
-    const prevSource = getMetaValue("live_source");
-    if (prevSource && prevSource !== prov.kind) {
-      db().prepare("DELETE FROM symbol_samples WHERE namespace = ?").run(LIVE_NS);
-      setMeta("live_source_reset", JSON.stringify({ at: nowISO(), from: prevSource, to: prov.kind }));
-    }
     setMeta("live_source", prov.kind);
   }
   const symbols = namespace === LIVE_NS ? liveSymbols() : [];
@@ -81,7 +75,7 @@ async function runIngestInner(namespace: string, provider?: MarketDataProvider):
         asOfSource: q.asOfSource ?? "provider",
       });
       recordFetch(namespace, symbol, {
-        attemptAt, provider: prov.kind,
+        attemptAt, provider: prov.kind, httpStatus: q.httpStatus, price: q.price,
         outcome: res.accepted ? "accepted" : res.duplicate ? "duplicate" : "rejected",
         providerAsOf: q.asOf.toISOString(), reason: res.accepted ? null : (res.reason ?? null),
       });
@@ -102,7 +96,7 @@ async function runIngestInner(namespace: string, provider?: MarketDataProvider):
   }
   pruneRetention();
   const result: IngestResult = { symbols, events, rejected, durationMs: Date.now() - t0, at: nowISO() };
-  setMeta("ingest_health", JSON.stringify({ ...result, failures: rejected }));
+  setMeta("ingest_health", JSON.stringify({ ...result, failures: rejected, lastSuccessAt: rejected === 0 ? result.at : ingestHealth().lastSuccessAt ?? null }));
   return result;
 }
 

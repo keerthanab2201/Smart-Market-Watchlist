@@ -1,4 +1,5 @@
 export interface Quote {
+  httpStatus?: number;
   symbol: string;
   price: number;
   /** Null when the provider does not report volume (e.g. Finnhub /quote). */
@@ -92,7 +93,7 @@ export const finnhubProvider: MarketDataProvider = {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 8000);
     try {
-      const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${key}`, { signal: ctrl.signal });
+      const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}`, { signal: ctrl.signal, headers: { "X-Finnhub-Token": key }, cache: "no-store" });
       if (res.status === 429) throw new Error("finnhub rate limited");
       if (!res.ok) throw new Error(`finnhub HTTP ${res.status}`);
       const j = await res.json() as { c?: number; pc?: number; t?: number };
@@ -100,9 +101,9 @@ export const finnhubProvider: MarketDataProvider = {
       if (!(typeof px === "number" && px > 0)) throw new Error("finnhub returned no price");
       const hasT = typeof j.t === "number";
       return {
-        symbol: symbol.toUpperCase(), price: px, volume: null,
+        httpStatus: res.status, symbol: symbol.toUpperCase(), price: px, volume: null,
         asOf: hasT ? new Date((j.t as number) * 1000) : new Date(),
-        source: "finnhub", prevClose: typeof j.pc === "number" && j.pc > 0 ? j.pc : null, delaySec: 60,
+        source: "finnhub", prevClose: typeof j.pc === "number" && j.pc > 0 ? j.pc : null, delaySec: null,
         asOfSource: hasT ? "provider" : "fetch",
       };
     } finally {
