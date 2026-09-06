@@ -15,6 +15,7 @@ interface Quote {
   company: string | null; source: string; asOf: string | null;
   sinceReview: { pct: number; baselineAsOf: string } | null;
   quality: Quality; version: number; currency: "USD" | "INR";
+  fetch: { attemptAt: string; outcome: string; providerAsOf: string | null; reason: string | null } | null;
 }
 interface BriefEvent {
   id: number; symbol: string; company: string | null; score: number;
@@ -63,7 +64,10 @@ function QuietRow({ q, onOpen, onRemove, removing }: {
   q: Quote; onOpen: (s: string) => void; onRemove: (s: string) => void; removing: boolean;
 }) {
   const d = directionOf(q.sinceReview?.pct ?? null);
-  const pct = q.sinceReview ? `${d === "down" ? "−" : d === "up" ? "+" : ""}${Math.abs(q.sinceReview.pct).toFixed(2)}%` : "N/A";
+  const pct = q.sinceReview ? `${d === "down" ? "−" : d === "up" ? "+" : ""}${Math.abs(q.sinceReview.pct).toFixed(2)}%` : "No baseline";
+  const sinceTitle = q.sinceReview
+    ? `Change since your last review${q.isStale ? " — quote is stale, baseline may be outdated" : ""}`
+    : "No review baseline — review to set one";
   const pctCls = d === "flat" ? "text-zinc-500" : d === "up" ? "text-emerald-400/90" : "text-red-400/90";
   const status = q.quality.kind === "stale"
     ? <span className="text-[11px] text-amber-200/80" title={q.freshnessLabel}>Stale quote</span>
@@ -77,7 +81,7 @@ function QuietRow({ q, onOpen, onRemove, removing }: {
         <span className="tnum shrink-0 font-mono text-[13px] text-zinc-200 sm:hidden">{fmtMoney(q.symbol, q.price)}</span>
       </div>
       <div className="mt-1 flex items-center justify-between gap-2 sm:hidden">
-        <span className={`tnum font-mono text-xs ${pctCls}`} title="Change since your last review">{pct}</span>
+        <span className={`tnum font-mono text-xs ${pctCls}`} title={sinceTitle}>{pct}</span>
         <span className="flex items-center gap-2">
           {status}
           <button onClick={() => onOpen(q.symbol)} aria-label={`View ${q.symbol} details`} className="rounded px-1.5 py-1 text-[11px] text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-500">Details</button>
@@ -85,7 +89,7 @@ function QuietRow({ q, onOpen, onRemove, removing }: {
         </span>
       </div>
       <span className="tnum hidden text-right font-mono text-[13px] text-zinc-200 sm:block">{fmtMoney(q.symbol, q.price)}</span>
-      <span className={`tnum hidden text-right font-mono text-xs tabular-nums sm:block ${pctCls}`} title="Change since your last review">{pct}</span>
+      <span className={`tnum hidden text-right font-mono text-xs tabular-nums sm:block ${pctCls}`} title={sinceTitle}>{pct}</span>
       <span className="hidden sm:block">{status}</span>
       <span className="hidden items-center gap-1 sm:flex">
         <button onClick={() => onOpen(q.symbol)} aria-label={`View ${q.symbol} details`} className="rounded px-1.5 py-1 text-[11px] text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-500">Details</button>
@@ -152,6 +156,8 @@ export default function Home() {
   const [wlName, setWlName] = useState("");
   const [quotes, setQuotes] = useState<Quote[]>([]);
   const [events, setEvents] = useState<BriefEvent[]>([]);
+  const [priorEvents, setPriorEvents] = useState<BriefEvent[]>([]);
+  const [sourceNotices, setSourceNotices] = useState<{ symbol: string; text: string }[]>([]);
   const [reviewToken, setReviewToken] = useState<string | null>(null);
   const [tracking, setTracking] = useState<boolean | null>(null);
   const [trackingSince, setTrackingSince] = useState<string | null>(null);
@@ -162,7 +168,7 @@ export default function Home() {
   const [acking, setAcking] = useState(false);
   const [starting, setStarting] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [market, setMarket] = useState({ open: true, label: "", note: "" });
+  const [market, setMarket] = useState({ open: true, label: "", note: "", etNow: "" });
   const [mode, setMode] = useState("simulated");
   const [input, setInput] = useState("");
   const [err, setErr] = useState<string | null>(null);
@@ -234,6 +240,8 @@ export default function Home() {
       setTrackingSince(c.trackingSince ?? null);
       setReviewedAt(c.reviewedAt ?? null);
       setEvents(c.events ?? []);
+      setPriorEvents(c.priorSourceEvents ?? []);
+      setSourceNotices(c.sourceNotices ?? []);
       setReviewToken(c.reviewToken ?? null);
       setUnreadTotal(c.unreadTotal ?? 0);
       setCoverage(c.coverage?.incomplete ? c.coverage : null);
@@ -332,7 +340,7 @@ export default function Home() {
     setAcking(true);
     setAckError(null);
     try {
-      const ids = visibleEvents.map((e) => e.id);
+      const ids = [...visibleEvents, ...priorVisible].map((e) => e.id);
       const r = await fetch(`/api/watchlists/${wlId}/mark-seen`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: reviewToken, eventIds: ids }),
@@ -467,6 +475,7 @@ export default function Home() {
 
   const threshold = SENS[sens];
   const visibleEvents = events.filter((e) => e.score >= threshold);
+  const priorVisible = priorEvents.filter((e) => e.score >= threshold);
   const hiddenBySens = events.length - visibleEvents.length;
   const attn = quotes.filter((q) => q.score >= threshold);
   const quiet = quotes.filter((q) => q.score < threshold);
@@ -483,12 +492,14 @@ export default function Home() {
 
   // Badge reflects the configured provider AND the actual quote sources, so
   // stored simulated observations are never presented as real market data.
+  // "Finnhub" appears only when every displayed quote actually is Finnhub.
   const quoteSources = new Set(quotes.map((q) => q.source));
+  const allFinnhub = quoteSources.size > 0 && [...quoteSources].every((s) => s === "finnhub");
+  const mixedSources = quoteSources.size > 0 && !allFinnhub && [...quoteSources].some((s) => s === "finnhub");
   const modeLabel = mode === "demo-simulated" || demoFrozen
     ? "Demo · simulated"
-    : mode === "real-provider" && quoteSources.size > 0 && ![...quoteSources].every((s) => s === "finnhub")
-      ? "Simulated observations"
-      : mode === "real-provider" ? "Real provider · delayed" : "Simulated feed";
+    : allFinnhub ? "Finnhub · delayed"
+      : mixedSources ? "Mixed data sources" : "Simulated feed";
 
   return (
     <main className="mx-auto max-w-[1120px] px-4 py-5">
@@ -504,7 +515,7 @@ export default function Home() {
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${demoFrozen ? "bg-amber-500/15 text-amber-300" : modeLabel.startsWith("Real provider") ? "bg-emerald-500/10 text-emerald-300" : "bg-zinc-800 text-zinc-300"}`}>
+          <span title={mode === "real-provider" && !allFinnhub ? "Finnhub is configured, but some displayed quotes were stored earlier from simulation" : undefined} className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${demoFrozen ? "bg-amber-500/15 text-amber-300" : modeLabel.startsWith("Finnhub") ? "bg-emerald-500/10 text-emerald-300" : "bg-zinc-800 text-zinc-300"}`}>
             {modeLabel}
           </span>
           <button onClick={() => setHowOpen(true)} className="rounded-lg px-2.5 py-1 text-xs text-zinc-300 hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-zinc-500">How it works</button>
@@ -553,7 +564,7 @@ export default function Home() {
         {reviewedAt ? (
           <> · Last reviewed <span title={new Date(reviewedAt).toLocaleString()}>{timeAgo(reviewedAt)}</span></>
         ) : tracking ? " · Not yet reviewed" : null}
-        {market.label ? <> · <span title={market.note}>{market.open ? "Market open" : "Market closed"} (approx. hours)</span></> : null}
+        {market.label ? <> · <span title={market.note}>{market.label}{market.etNow ? ` · ${market.etNow}` : ""}</span></> : null}
         <button onClick={() => wlId && loadBriefing(wlId)} disabled={refreshing || !wlId} aria-label="Refresh briefing"
           className="ml-2 rounded px-1.5 py-0.5 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-zinc-500">
           <span className={`inline-block ${refreshing ? "animate-spin" : ""}`} aria-hidden="true">↻</span> {refreshing ? "Refreshing…" : "Refresh"}
@@ -565,9 +576,9 @@ export default function Home() {
           <h2 className="text-[13px] font-semibold text-zinc-200">
             Since your last review{!loading && tracking && unreadTotal > 0 ? ` · ${unreadTotal} unread` : ""}
           </h2>
-          {!loading && tracking && visibleEvents.length > 0 && (
+          {!loading && tracking && (visibleEvents.length + priorVisible.length) > 0 && (
             <button onClick={acknowledge} disabled={acking} className="rounded-lg bg-zinc-100 px-2.5 py-1 text-xs font-semibold text-zinc-900 hover:bg-white disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-zinc-400">
-              {acking ? "Reviewing…" : `Mark displayed changes as reviewed (${visibleEvents.length})`}
+              {acking ? "Reviewing…" : `Mark displayed changes as reviewed (${visibleEvents.length + priorVisible.length})`}
             </button>
           )}
         </div>
@@ -576,6 +587,16 @@ export default function Home() {
         ) : trackingSince ? (
           <p className="mt-0.5 text-[11px] text-zinc-500">Tracking started <span title={new Date(trackingSince).toLocaleString()}>{timeAgo(trackingSince)}</span></p>
         ) : null)}
+        {!loading && tracking && sourceNotices.length > 0 && (
+          <div className="mt-2 rounded-lg border border-amber-500/25 bg-amber-500/[0.05] px-2.5 py-1.5" role="note">
+            {sourceNotices.map((n) => (
+              <p key={n.symbol} className="text-xs text-amber-200/90">{n.text}</p>
+            ))}
+            <button onClick={startTrackingNow} disabled={starting} className="mt-1.5 rounded-lg bg-zinc-100 px-2.5 py-1 text-xs font-semibold text-zinc-900 hover:bg-white disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-zinc-400">
+              {starting ? "Starting…" : "Start a new review baseline"}
+            </button>
+          </div>
+        )}
         {loading ? (
           <div className="mt-2 space-y-1.5"><Skeleton className="h-4 w-full" /><Skeleton className="h-4 w-2/3" /></div>
         ) : tracking === false ? (
@@ -622,8 +643,43 @@ export default function Home() {
             {unreadTotal > events.length && (
               <p className="mt-1 text-[11px] text-zinc-500">Showing {events.length} of {unreadTotal} unread — reviewing here acknowledges only what is displayed.</p>
             )}
+            {priorVisible.length > 0 && (
+              <div className="mt-2 border-t border-zinc-800/70 pt-2">
+                <h3 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Earlier simulated signals</h3>
+                <ul className="mt-1 space-y-1.5">
+                  {priorVisible.map((e) => (
+                    <li key={e.id} className="rounded-lg border border-zinc-800/50 p-2 opacity-80">
+                      <div className="flex items-baseline justify-between gap-2 text-[13px]">
+                        <span className="font-mono font-semibold text-zinc-300">{e.symbol}</span>
+                        <span className="shrink-0 text-[11px] text-zinc-600" title={new Date(e.occurred_at).toLocaleString()}>{timeAgo(e.occurred_at)}</span>
+                      </div>
+                      <p className="mt-0.5 text-xs text-zinc-500">{e.summary}</p>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {ackError && <p className="mt-1.5 text-xs text-red-300" role="alert">{ackError} <button onClick={acknowledge} className="underline">Retry</button></p>}
           </>
+        ) : priorVisible.length > 0 ? (
+          <div className="mt-1">
+            <p className="text-[13px] text-zinc-400">No new real-provider signals — {priorVisible.length} earlier simulated signal{priorVisible.length === 1 ? "" : "s"} below.</p>
+            <ul className="mt-1.5 space-y-1.5">
+              {priorVisible.map((e) => (
+                <li key={e.id} className="rounded-lg border border-zinc-800/50 p-2 opacity-80">
+                  <div className="flex items-baseline justify-between gap-2 text-[13px]">
+                    <span className="font-mono font-semibold text-zinc-300">{e.symbol}</span>
+                    <span className="shrink-0 text-[11px] text-zinc-600" title={new Date(e.occurred_at).toLocaleString()}>{timeAgo(e.occurred_at)}</span>
+                  </div>
+                  <p className="mt-0.5 text-xs text-zinc-500">{e.summary}</p>
+                </li>
+              ))}
+            </ul>
+            <button onClick={acknowledge} disabled={acking || !reviewToken} className="mt-2 rounded-lg bg-zinc-100 px-2.5 py-1 text-xs font-semibold text-zinc-900 hover:bg-white disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-zinc-400">
+              {acking ? "Reviewing…" : `Mark displayed changes as reviewed (${priorVisible.length})`}
+            </button>
+            {ackError && <p className="mt-1.5 text-xs text-red-300" role="alert">{ackError} <button onClick={acknowledge} className="underline">Retry</button></p>}
+          </div>
         ) : (
           <div className="mt-1 text-[13px] leading-relaxed text-zinc-400">
             {allUnavailable ? (
@@ -742,9 +798,9 @@ export default function Home() {
                       </div>
                       <div className="mt-1 flex flex-wrap items-center gap-2">
                         <span title={bdTitle(q)}><TierTag score={q.score} /></span>
-                        <span className={`font-mono text-lg font-bold tabular-nums ${d === "flat" ? "text-zinc-300" : up ? "text-emerald-300" : "text-red-300"}`}
-                          title={q.sinceReview ? `Since review baseline (${timeAgo(q.sinceReview.baselineAsOf)})` : "No reviewed baseline yet"}>
-                          {sr == null ? "N/A" : `${d === "down" ? "−" : d === "up" ? "+" : ""}${Math.abs(sr).toFixed(1)}%`}
+                        <span className={`font-mono tabular-nums ${sr == null ? "text-sm text-zinc-500" : "text-lg font-bold"} ${d === "flat" ? "text-zinc-300" : up ? "text-emerald-300" : "text-red-300"}`}
+                          title={q.sinceReview ? `Since review baseline (${timeAgo(q.sinceReview.baselineAsOf)})${q.isStale ? " — quote is stale, baseline may be outdated" : ""}` : "No review baseline — review to set one"}>
+                          {sr == null ? "No baseline" : `${d === "down" ? "−" : d === "up" ? "+" : ""}${Math.abs(sr).toFixed(1)}%`}
                         </span>
                         <span className="text-[10px] text-zinc-500">since review</span>
                       </div>
@@ -831,15 +887,22 @@ export default function Home() {
                 {drawerQ.sinceReview ? `${drawerQ.sinceReview.pct >= 0 ? "+" : "−"}${Math.abs(drawerQ.sinceReview.pct).toFixed(2)}% since review` : "Not available — review to set a baseline"}
               </p>
             </div>
-            <p className={`mt-1.5 font-mono text-xs font-bold uppercase tracking-wider ${tierOf(drawerQ.score) === "high" ? "text-red-300" : tierOf(drawerQ.score) === "watch" ? "text-amber-300" : "text-zinc-500"}`}>
-              {TIER_LABEL[tierOf(drawerQ.score)]} · {drawerQ.score}
+            <p className={`mt-1.5 font-mono text-xs font-bold uppercase tracking-wider ${tierOf(drawerQ.score) === "high" ? "text-red-300" : tierOf(drawerQ.score) === "watch" ? "text-amber-300" : "text-zinc-500"}`}
+              title={drawerQ.score === 0 ? "No scoring evidence yet — this is not a calm-market verdict" : undefined}>
+              {drawerQ.score === 0 && (drawerQ.missing.includes("baseline") || drawerQ.missing.includes("volatility"))
+                ? "Insufficient history"
+                : `${TIER_LABEL[tierOf(drawerQ.score)]} · ${drawerQ.score}`}
             </p>
             <h4 className="mb-1 mt-3 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Why it matters</h4>
             <p className="text-[13px] leading-relaxed text-zinc-300">
               <span className="text-zinc-500">Recent price action: </span>{describe(drawerQ)}
             </p>
             {(drawerQ.missing.includes("baseline") || drawerQ.missing.includes("volatility")) && (
-              <p className="mt-1 text-xs text-zinc-500">Learning this stock&apos;s recent behavior — some inputs aren&apos;t available yet.</p>
+              <p className="mt-1 text-xs text-zinc-500">
+                {drawerQ.source === "finnhub"
+                  ? "Waiting for enough real-provider observations to assess changes."
+                  : "Learning this stock's recent behavior — some inputs aren't available yet."}
+              </p>
             )}
             {drawerEvents.length > 0 && (
               <div className="mt-2 rounded-lg border border-zinc-800 p-2 text-xs text-zinc-400">
@@ -874,6 +937,11 @@ export default function Home() {
               <p className="capitalize text-zinc-400">{q.kind} · {q.detail}</p>
               <p className="mt-0.5 text-zinc-500">Source: {drawerQ.source === "demo" ? "simulated (demo)" : drawerQ.source}{drawerQ.asOf ? ` · observed ${timeAgo(drawerQ.asOf)}` : ""}
                 {drawerQ.low52w != null ? ` · observed range ${fmtMoney(drawerQ.symbol, drawerQ.low52w)}–${fmtMoney(drawerQ.symbol, drawerQ.high52w ?? drawerQ.low52w)}` : ""}</p>
+              <p className="mt-0.5 text-zinc-500">
+                {drawerQ.fetch
+                  ? `Last check ${timeAgo(drawerQ.fetch.attemptAt)} · ${drawerQ.fetch.outcome === "error" ? `update failed${drawerQ.fetch.reason ? `: ${drawerQ.fetch.reason}` : ""}` : drawerQ.fetch.outcome === "duplicate" ? "update ok — same session observation" : "update ok"}`
+                  : "No fetch recorded yet"}
+              </p>
             </div>
             <details className="mt-3">
               <summary className="cursor-pointer text-xs text-zinc-400 underline-offset-2 hover:text-zinc-200 hover:underline focus:outline-none focus:ring-2 focus:ring-zinc-500">
@@ -915,7 +983,7 @@ export default function Home() {
               <li><span className="font-mono text-zinc-100">15 pts · Trend reversal</span><br /><span className="text-xs text-zinc-500">Short vs medium sample windows (needs 7 closes)</span></li>
             </ul>
             <p className="mt-2.5 text-[13px] text-zinc-300"><span className="font-mono text-amber-300">55+ Worth Watching</span> · <span className="font-mono text-red-300">80+ High Attention</span></p>
-            <p className="mt-1.5 text-xs leading-relaxed text-zinc-500">Missing inputs score zero without reweighting. Freshness is shown separately and never inflates a score. No new signals fire when the market is closed.</p>
+            <p className="mt-1.5 text-xs leading-relaxed text-zinc-500">Missing inputs score zero without reweighting. Freshness is shown separately and never inflates a score. No new signals fire when the market is closed. Market open/closed uses a weekday ET approximation — holidays and early closes aren&apos;t modelled.</p>
             <p className="mt-1.5 border-t border-zinc-800/70 pt-1.5 text-[11px] leading-relaxed text-zinc-600">Observations are sampled about every 60 seconds by one shared scheduler. Quotes are kept 7 days, events 30 days — older gaps are labelled as coverage gaps. Market open/closed is a weekday ET approximation; holidays and early closes aren&apos;t modelled.</p>
           </div>
         </div>
