@@ -1,7 +1,7 @@
 import { ctx, notFound, requireWatchlist, enrich, NextResponse } from "@/lib/shared";
 import {
   db, itemsFor, unreadEvents, unreadCount, trackingSince, lastReviewedAt,
-  createSnapshot, latestQuote, coverageFor, displaySource, sourceTransitions,
+  createSnapshot, displayQuote, coverageFor, displaySource, sourceTransitions,
   LIVE_NS, demoNs,
 } from "@/lib/db";
 import { companyName } from "@/lib/companies";
@@ -21,6 +21,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     return NextResponse.json({
       tracking: false, events: [], priorSourceEvents: [], baselines: {}, reviewToken: null,
       reviewedAt: null, unreadTotal: 0, coverage: null, sourceNotices: [],
+      ...(new URL(req.url).searchParams.get("include") === "quotes" ? { quotes: enrich(symbols, ns, wl.id, user.id) } : {}),
     });
   }
 
@@ -46,8 +47,8 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
       .map((r) => [r.symbol, r.added_at] as const)
   );
   for (const s of symbols) {
-    const q = latestQuote(ns, s);
-    if (q) baselines[s] = { price: Number(q.price), asOf: q.as_of, addedAt: addedAt.get(s) ?? since, source: displaySource(ns, s) };
+    const q = displayQuote(ns, s);
+    if (q) baselines[s] = { price: Number(q.price), asOf: q.as_of, addedAt: addedAt.get(s) ?? since, source: q.source };
   }
   const eventIds = [...shownCurrent, ...shownPrior].map((e) => e.id);
   const reviewToken = createSnapshot(wl.id, user.id, eventIds, baselines);

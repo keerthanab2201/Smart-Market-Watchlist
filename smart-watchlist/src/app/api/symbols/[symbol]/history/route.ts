@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { ctx, requireWatchlist } from "@/lib/shared";
-import { recentQuotes, readBaseline, LIVE_NS, demoNs } from "@/lib/db";
+import { recentQuotes, displaySource, readBaseline, LIVE_NS, demoNs } from "@/lib/db";
 
 export async function GET(req: Request, { params }: { params: Promise<{ symbol: string }> }) {
   const { symbol } = await params;
@@ -14,12 +14,12 @@ export async function GET(req: Request, { params }: { params: Promise<{ symbol: 
     if (!wl) return NextResponse.json({ error: "Watchlist not found" }, { status: 404 });
     ns = wl.is_demo ? demoNs(user.id) : LIVE_NS;
   }
-  const rows = recentQuotes(ns, sym, 30);
+  const rows = recentQuotes(ns, sym, 30, displaySource(ns, sym));
   return NextResponse.json({
     symbol: sym,
     namespace: ns,
     // Accepted observation samples — NOT daily session history.
-    samples: rows.map((h) => ({ price: Number(h.price), asOf: h.as_of, volume: Number(h.volume), source: h.source })),
+    samples: rows.map((h) => ({ price: Number(h.price), asOf: h.as_of, volume: h.volume == null ? null : Number(h.volume), source: h.source })),
     baseline: readBaseline(ns, sym),
   });
 }

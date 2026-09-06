@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { ctx } from "@/lib/shared";
 import { authorizeIngest } from "@/lib/db";
 import {
-  db, liveSymbols, latestQuote, fetchStatus,
+  DB_PATH, db, liveSymbols, displayQuote, fetchStatus,
   getMetaValue, migrationStatus, dedupeStatus,
 } from "@/lib/db";
 import { getProvider } from "@/lib/market";
@@ -22,7 +22,7 @@ export async function GET(req: Request) {
   const symbols = liveSymbols();
   const perSymbol = symbols.map((symbol) => {
     const fetch = fetchStatus("live", symbol);
-    const latest = latestQuote("live", symbol);
+    const latest = displayQuote("live", symbol);
     const counts = h.prepare("SELECT source, COUNT(*) AS n, MAX(as_of) AS mx FROM quotes WHERE namespace = 'live' AND symbol = ? GROUP BY source")
       .all(symbol) as unknown as { source: string; n: number; mx: string }[];
     return {
@@ -30,6 +30,9 @@ export async function GET(req: Request) {
       configuredProvider: provider.name,
       lastFetchAttempt: fetch?.attemptAt ?? null,
       fetchOutcome: fetch?.outcome ?? null,
+      httpStatus: fetch?.httpStatus ?? null,
+      returnedPrice: fetch?.price ?? null,
+      lastSuccessfulCheck: fetch?.lastSuccessAt ?? null,
       fetchReason: fetch?.reason ?? null,
       providerTimestamp: fetch?.providerAsOf ?? null,
       latestAcceptedAt: latest?.as_of ?? null,
@@ -39,6 +42,7 @@ export async function GET(req: Request) {
   });
   return NextResponse.json({
     ok: true,
+    runtime: { pid: process.pid, cwd: process.cwd(), mode: process.env.NODE_ENV, databasePath: DB_PATH, startedAt: new Date(Date.now() - process.uptime() * 1000).toISOString() },
     finnhubKeyConfigured: !!process.env.FINNHUB_KEY,
     provider: provider.name,
     providerKind: provider.kind,

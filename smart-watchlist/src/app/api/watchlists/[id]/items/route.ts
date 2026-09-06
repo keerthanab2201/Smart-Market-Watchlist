@@ -1,5 +1,5 @@
 import { ctx, notFound, requireWatchlist, NextResponse, normalizeSymbol, VALID_SYMBOLS } from "@/lib/shared";
-import { db, addItem, itemsFor, latestQuote, LIVE_NS, demoNs } from "@/lib/db";
+import { addItem, itemsFor } from "@/lib/db";
 import { companyName } from "@/lib/companies";
 
 const MAX_ITEMS = 50;
@@ -23,14 +23,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
   }
   const { created } = addItem(wl.id, symbol);
   if (!created) return NextResponse.json({ symbol, deduped: true });
-  // A new item's tracking starts at addition: baseline it to the latest quote
-  // so pre-addition events are never presented as new.
-  const ns = wl.is_demo ? demoNs(user.id) : LIVE_NS;
-  const q = latestQuote(ns, symbol);
-  if (q) {
-    db().prepare(`INSERT INTO item_baselines(watchlist_id, user_id, symbol, price, quote_id, as_of)
-      VALUES (?,?,?,?,?,?) ON CONFLICT(watchlist_id, user_id, symbol) DO NOTHING`)
-      .run(wl.id, user.id, symbol, q.price, q.id, q.as_of);
-  }
+  // Membership starts now; a review baseline requires an explicit review.
   return NextResponse.json({ symbol });
 }
