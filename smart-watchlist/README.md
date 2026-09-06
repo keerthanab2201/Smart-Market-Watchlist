@@ -134,3 +134,22 @@ explicit update-failure labels — never silently simulated prices.
    briefing → only the injected event remains unread.
 5. Kill the feed/one symbol fails → last-known-good quotes stay visible with
    true timestamps and stale labels.
+
+
+### Provenance repair and runtime verification (September 6, 2026)
+
+Run one persistent server against durable SQLite. Do not run development and production simultaneously against the same database. Multiple instances require PostgreSQL and coordinated ingestion; the in-process scheduler is not a distributed scheduler.
+
+Review baselines now store the source and membership ID. Unknown legacy provenance is not used for returns. Adding a stock creates a new membership and requires an explicit review baseline; shared quotes remain. Briefings and history select the same displayed source. Refresh reads stored observations; ingestion is performed by the approximately 60-second scheduler or the authenticated POST /api/ingest.
+
+For an explicit repair of legacy duplicates and derived statistics, stop the app, set SW_DB_PATH if using a custom database, and run from smart-watchlist:
+
+```powershell
+node --experimental-strip-types --import ../tests/register.mjs scripts/repair-provenance.mjs
+```
+
+The repair creates a complete SQLite VACUUM backup before mutation, reports removed duplicate counts, preserves old simulation observations, normalizes legacy Finnhub volume zeroes to null, and rebuilds scores/statistics from the active source only. Existing event evidence is not regenerated. The database repair is explicit, not a startup cleanup.
+
+GET /api/diag reports PID, process working directory, mode, database path, provider selection, scheduler health and per-symbol HTTP outcomes without credentials. Production diagnostics and manual ingestion require x-ingest-secret matching INGEST_SECRET. SW_DISABLE_SCHEDULER=1 is reserved for isolated test runs. Finnhub credentials are sent in the provider header, never a logged URL.
+
+Observed real retrieval: HTTP 200 for TSLA at $354.08, provider timestamp 2026-09-04T20:00:00Z; a repeat was deduplicated. This verifies retrieval, not a claim of exchange-level real-time latency. Session status uses a weekday ET approximation and does not model holidays or early closes.
