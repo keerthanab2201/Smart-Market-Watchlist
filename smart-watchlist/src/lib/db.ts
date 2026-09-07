@@ -199,8 +199,9 @@ function migrateSchema(h: DatabaseSync): void {
  * import transaction commits; failures are recorded with the cause, the
  * source file is preserved, and retryLegacyMigration() can re-run it.
  */
-function migrateLegacySync(h: DatabaseSync): void {
-  if (migrationState(h)?.status === "ok") return;
+function migrateLegacySync(h: DatabaseSync, retry = false): void {
+  const status = migrationState(h)?.status;
+  if (status === "ok" || (status === "failed" && !retry)) return;
   let raw: string;
   try {
     raw = readFileSync(LEGACY_PATH, "utf8");
@@ -238,13 +239,13 @@ function migrateLegacySync(h: DatabaseSync): void {
     );
     for (const e of events.slice(-200)) {
       ie.run(e.symbol, e.score, JSON.stringify(e.reasons), e.summary, 0, null, null,
-        JSON.stringify({}), "legacy", e.occurred_at, `legacy:${e.id}`, 1);
+        JSON.stringify({}), "legacy", e.occurred_at, `legacy:${e.id}`);
     }
     const ir = h.prepare("INSERT OR IGNORE INTO reviews(watchlist_id, user_id, tracking_since, reviewed_at) VALUES (?,?,?,?)");
     for (const v of views) ir.run(v.watchlist_id, v.user_id, v.last_seen_at, v.last_seen_at);
-    h.exec("COMMIT");
-    try { renameSync(LEGACY_PATH, `${LEGACY_PATH}.bak`); } catch { /* backup optional */ }
     setMetaOn(h, "legacy_migration", JSON.stringify({ status: "ok", at: nowISO() }));
+    h.exec("COMMIT");
+    try { renameSync(LEGACY_PATH, `${LEGACY_PATH}.bak`); } catch { /* committed marker prevents duplicate imports */ }
   } catch (e) {
     try { h.exec("ROLLBACK"); } catch { /* already rolled back */ }
     setMetaOn(h, "legacy_migration", JSON.stringify({ status: "failed", error: String(e), at: nowISO() }));
@@ -256,7 +257,7 @@ export function retryLegacyMigration(): Record<string, unknown> {
   const h = db();
   if (migrationState(h)?.status === "ok") return { status: "ok", note: "already migrated" };
   if (!existsSync(LEGACY_PATH)) throw new Error("no legacy db.json present to retry");
-  migrateLegacySync(h);
+  migrateLegacySync(h, true);
   return JSON.parse(getMeta(h, "legacy_migration") ?? '{"status":"unknown"}') as Record<string, unknown>;
 }
 
@@ -322,10 +323,14 @@ export function itemAddedAt(watchlistId: string, symbol: string): string | null 
 }
 
 /** INSERT OR IGNORE — returns true when a new row was created. Safe under concurrency. */
-export function addItem(watchlistId: string, symbol: string, at = nowISO()): { created: boolean } {
-  const r = db().prepare("INSERT OR IGNORE INTO items(id, watchlist_id, symbol, added_at, event_floor) VALUES (?,?,?,?,(SELECT COALESCE(MAX(id),0) FROM events))")
-    .run(uid(), watchlistId, symbol, at);
-  return { created: Number(r.changes) === 1 };
+export function addItem(watchlistId: string, symbol: string, at = nowISO(), limit = Infinity): { created: boolean; limitReached?: boolean } {
+  return tx(h => {
+    if (h.prepare("SELECT 1 FROM items WHERE watchlist_id=? AND symbol=?").get(watchlistId,symbol)) return {created:false};
+    const count = h.prepare("SELECT COUNT(*) n FROM items WHERE watchlist_id=?").get(watchlistId) as {n:number};
+    if (count.n >= limit) return {created:false,limitReached:true};
+    h.prepare("INSERT INTO items(id,watchlist_id,symbol,added_at,event_floor) VALUES (?,?,?,?,(SELECT COALESCE(MAX(id),0) FROM events))").run(uid(),watchlistId,symbol,at);
+    return {created:true};
+  });
 }
 
 export function removeItem(watchlistId: string, userId: string, symbol: string): boolean {
@@ -856,15 +861,24 @@ export function dedupeStatus(): Record<string, unknown> {
 }
 
 export function pruneRetention(): { quotes: number; events: number } {
-  const h = db();
-  const qCut = new Date(Date.now() - 7 * 86400_000).toISOString();
-  const eCut = new Date(Date.now() - 30 * 86400_000).toISOString();
-  const q = h.prepare("DELETE FROM quotes WHERE as_of < ?").run(qCut);
-  const e = h.prepare("DELETE FROM events WHERE occurred_at < ?").run(eCut);
-  h.prepare("DELETE FROM briefing_snapshots WHERE created_at < ?").run(new Date(Date.now() - 86400_000).toISOString());
-  const out = { quotes: Number(q.changes), events: Number(e.changes) };
-  setMeta("retention_last_prune", JSON.stringify({ at: nowISO(), eventsCutoff: eCut, quotesCutoff: qCut, ...out }));
-  return out;
+  return tx(h => {
+    const qCut = new Date(Date.now() - 7 * 86400_000).toISOString();
+    const eCut = new Date(Date.now() - 30 * 86400_000).toISOString();
+    const removed = h.prepare("SELECT namespace, COUNT(*) n, MAX(occurred_at) newest FROM events WHERE occurred_at < ? GROUP BY namespace").all(eCut) as {namespace:string;n:number;newest:string}[];
+    // Keep the last known good quote in every source, even through a long outage.
+    const q = h.prepare(`DELETE FROM quotes WHERE as_of < ? AND EXISTS (SELECT 1 FROM quotes newer WHERE newer.namespace=quotes.namespace AND newer.symbol=quotes.symbol AND newer.source=quotes.source AND (newer.as_of>quotes.as_of OR (newer.as_of=quotes.as_of AND newer.id>quotes.id)))`).run(qCut);
+    h.prepare("DELETE FROM quote_scores WHERE quote_id NOT IN (SELECT id FROM quotes)").run();
+    const e = h.prepare("DELETE FROM events WHERE occurred_at < ?").run(eCut);
+    h.prepare("DELETE FROM reviewed_events WHERE event_id NOT IN (SELECT id FROM events)").run();
+    h.prepare("DELETE FROM briefing_snapshots WHERE created_at < ?").run(new Date(Date.now()-86400_000).toISOString());
+    for (const r of removed) {
+      const prior = JSON.parse(getMeta(h, 'retention:'+r.namespace) ?? '{}') as {events?:number;eventsCutoff?:string};
+      setMetaOn(h,'retention:'+r.namespace,JSON.stringify({events:(prior.events??0)+r.n,eventsCutoff:prior.eventsCutoff && prior.eventsCutoff>r.newest ? prior.eventsCutoff : r.newest}));
+    }
+    const out = {quotes:Number(q.changes),events:Number(e.changes)};
+    setMetaOn(h,"retention_last_prune",JSON.stringify({at:nowISO(),namespaceAware:true,eventsCutoff:eCut,quotesCutoff:qCut,...out}));
+    return out;
+  });
 }
 
 export interface CoverageInfo {
@@ -885,14 +899,15 @@ export function coverageFor(namespace: string, trackingSince: string): CoverageI
   let cutoff: string | null = null;
   let pruned = 0;
   try {
-    const raw = getMetaValue("retention_last_prune");
+    const legacy = getMetaValue("retention_last_prune");
+    const raw = getMetaValue("retention:"+namespace) ?? (legacy && !JSON.parse(legacy).namespaceAware ? legacy : null);
     if (raw) {
       const p = JSON.parse(raw) as { eventsCutoff?: string; events?: number };
       cutoff = p.eventsCutoff ?? null;
       pruned = p.events ?? 0;
     }
   } catch { /* treat as unknown */ }
-  const incomplete = pruned > 0 && cutoff != null && trackingSince < cutoff;
+  const incomplete = pruned > 0 && cutoff != null && trackingSince <= cutoff;
   return {
     oldestEventAt: oldest, retentionCutoff: cutoff, prunedEvents: pruned, incomplete,
     note: incomplete

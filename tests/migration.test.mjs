@@ -26,10 +26,11 @@ describe("legacy migration", () => {
       users: [{ id: "u1", device_token: "tok", email: null, created_at: "2026-01-01T00:00:00Z" }],
       watchlists: [{ id: "w1", user_id: "u1", name: "L", created_at: "2026-01-01T00:00:00Z" }],
       items: [{ id: "i1", watchlist_id: "w1", symbol: "AAPL", added_at: "2026-01-01T00:00:00Z" }],
-      snapshots: [], events: [], views: [],
+      snapshots: [], events: [{ id: 7, symbol: "AAPL", score: 60, reasons: ["sized_move"], summary: "Legacy move", occurred_at: "2026-01-01T01:00:00Z" }], views: [],
     }));
     const r = db.retryLegacyMigration();
     assert.equal(r.status, "ok");
+    assert.equal(db.db().prepare("SELECT COUNT(*) n FROM events WHERE fingerprint='legacy:7'").get().n, 1);
     assert.ok(db.getOwnedWatchlist("u1", "w1"), "migrated watchlist resolves");
     assert.deepEqual(db.itemsFor("w1").map((i) => i.symbol), ["AAPL"]);
   });
