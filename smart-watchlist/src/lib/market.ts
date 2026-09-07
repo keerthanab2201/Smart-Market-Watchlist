@@ -99,12 +99,12 @@ export const finnhubProvider: MarketDataProvider = {
       const j = await res.json() as { c?: number; pc?: number; t?: number };
       const px = j.c;
       if (!(typeof px === "number" && px > 0)) throw new Error("finnhub returned no price");
-      const hasT = typeof j.t === "number";
+      if (typeof j.t !== "number" || !Number.isFinite(j.t) || j.t <= 0) throw new Error("finnhub returned no valid provider timestamp");
       return {
         httpStatus: res.status, symbol: symbol.toUpperCase(), price: px, volume: null,
-        asOf: hasT ? new Date((j.t as number) * 1000) : new Date(),
+        asOf: new Date(j.t * 1000),
         source: "finnhub", prevClose: typeof j.pc === "number" && j.pc > 0 ? j.pc : null, delaySec: null,
-        asOfSource: hasT ? "provider" : "fetch",
+        asOfSource: "provider",
       };
     } finally {
       clearTimeout(timer);

@@ -120,3 +120,51 @@ describe("single-flight ingestion", () => {
     ingest.resetIngestFlight();
   });
 });
+
+describe("normal provider resilience", () => {
+  it("rejects missing or zero Finnhub timestamps instead of inventing observation times", async () => {
+    const {finnhubProvider}=await import("../smart-watchlist/src/lib/market.ts");
+    const originalFetch=globalThis.fetch;const originalKey=process.env.FINNHUB_KEY;
+    process.env.FINNHUB_KEY="fixture-key";
+    try {
+      for(const payload of [{c:100},{c:100,t:0},{c:100,t:-1}]){
+        globalThis.fetch=async()=>new Response(JSON.stringify(payload),{status:200});
+        await assert.rejects(finnhubProvider.getQuote("AAPL"),/timestamp/);
+      }
+    } finally {globalThis.fetch=originalFetch;if(originalKey===undefined)delete process.env.FINNHUB_KEY;else process.env.FINNHUB_KEY=originalKey;}
+  });
+  it("provider failure preserves the real quote and never creates simulated fallback", async () => {
+    const u=db.getOrCreateUser("outage");const wl=db.ensureDefaultWatchlist(u.id);db.addItem(wl.id,"OUTAGE");
+    const at=new Date().toISOString();db.scoreAndStore("live",{symbol:"OUTAGE",price:123,volume:null,asOf:at,fetchedAt:at,source:"finnhub",prevClose:null,delaySec:null,asOfSource:"provider"});
+    await ingest.runIngestAsync("live",{name:"finnhub",kind:"finnhub",supports:()=>true,getQuote:async()=>{throw Error("provider unavailable")},getHistory:async()=>[]});
+    assert.equal(db.displayQuote("live","OUTAGE").price,123);assert.equal(db.displayQuote("live","OUTAGE").source,"finnhub");
+    assert.equal(db.fetchStatus("live","OUTAGE").outcome,"error");assert.equal(db.recentQuotes("live","OUTAGE",20,"simulated").length,0);
+  });
+  it("retention preserves the last quote in each source and cleans orphaned scores", () => {
+    const old=new Date(Date.now()-10*86400000).toISOString();const older=new Date(Date.now()-11*86400000).toISOString();
+    const obs=(asOf,price,source)=>({symbol:"RETAIN",price,volume:null,asOf,fetchedAt:asOf,source,prevClose:null,delaySec:null,asOfSource:"provider"});
+    const first=db.scoreAndStore("live",obs(older,100,"finnhub"));db.scoreAndStore("live",obs(old,101,"finnhub"));db.scoreAndStore("live",obs(old,50,"simulated"));
+    db.pruneRetention();
+    assert.equal(db.displayQuote("live","RETAIN")?.price,101);
+    assert.equal(db.latestQuote("live","RETAIN","simulated")?.price,50);
+    assert.equal(db.readScore("live","RETAIN",first.quoteId),null);
+  });
+});
+
+describe("normal watchlist integrity",()=>{
+ it("duplicate add stays idempotent at the limit and new membership cannot exceed it",()=>{
+  const u=db.getOrCreateUser("limit-case");const w=db.ensureDefaultWatchlist(u.id);
+  assert.deepEqual(db.addItem(w.id,"AAPL",undefined,3),{created:false});
+  assert.equal(db.addItem(w.id,"MSFT",undefined,3).limitReached,true);
+  assert.equal(db.itemsFor(w.id).length,3);
+ });
+ it("coverage remains incomplete after subsequent no-op pruning",()=>{
+  const at=new Date(Date.now()-35*86400000).toISOString();
+  db.insertEvent({namespace:"coverage-audit",symbol:"AAPL",score:60,reasons:"[]",summary:"old event",observed_price:100,baseline_price:90,baseline_kind:"previous-observation",components:"{}",source:"simulated",occurred_at:at,fingerprint:"coverage-audit",version:2});
+  db.pruneRetention();
+  assert.equal(db.coverageFor("unrelated-audit",new Date(Date.now()-40*86400000).toISOString()).incomplete,false);
+  db.pruneRetention();
+  assert.equal(db.coverageFor("coverage-audit",new Date(Date.now()-40*86400000).toISOString()).incomplete,true);
+  assert.equal(db.coverageFor("unrelated-audit",new Date(Date.now()-40*86400000).toISOString()).incomplete,false);
+ });
+});
