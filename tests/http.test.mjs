@@ -101,6 +101,15 @@ describe("HTTP ownership + ingest auth", () => {
     assert.equal(h.prepare("SELECT COUNT(*) n FROM item_baselines WHERE watchlist_id=? AND symbol='TSLA'").get(idA).n,0);
     assert.equal(h.prepare("SELECT COUNT(*) n FROM quotes WHERE symbol='TSLA'").get().n,2);h.close();
   });
+
+  it("normal mode can review current prices without any events and refreshes session metadata",async()=>{
+    const snap=await(await a.fetch(`/api/watchlists/${idA}/changes?include=quotes`)).json();
+    assert.equal(snap.events.length,0);assert.ok(snap.market.etNow.includes("ET"));
+    const r=await a.fetch(`/api/watchlists/${idA}/mark-seen`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:snap.reviewToken,eventIds:[]})});
+    assert.equal(r.status,200);
+    const state=await(await a.fetch(`/api/watchlists/${idA}/changes?include=quotes`)).json();
+    assert.equal(state.quotes.find(q=>q.symbol==="TSLA").sinceReview.pct,0);
+  });
   it("ingest POST requires the secret", async () => {
     // No INGEST_SECRET configured here → every external POST is rejected.
     assert.equal((await a.fetch("/api/ingest", { method: "POST" })).status, 401);

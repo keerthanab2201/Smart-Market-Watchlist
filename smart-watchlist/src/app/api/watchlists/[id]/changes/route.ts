@@ -1,4 +1,4 @@
-import { ctx, notFound, requireWatchlist, enrich, NextResponse } from "@/lib/shared";
+import { ctx, notFound, requireWatchlist, enrich, marketState, NextResponse } from "@/lib/shared";
 import {
   db, itemsFor, unreadEvents, unreadCount, trackingSince, lastReviewedAt,
   createSnapshot, displayQuote, coverageFor, displaySource, sourceTransitions,
@@ -16,10 +16,11 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
   const ns = wl.is_demo ? demoNs(user.id) : LIVE_NS;
   const symbols = itemsFor(wl.id).map((i) => i.symbol);
   const since = trackingSince(wl.id, user.id);
+  const market = wl.is_demo ? {open:false,label:"Simulated session",note:"Scripted scenario; real exchange hours do not apply.",etNow:""} : marketState();
 
   if (!since) {
     return NextResponse.json({
-      tracking: false, events: [], priorSourceEvents: [], baselines: {}, reviewToken: null,
+      market, tracking: false, events: [], priorSourceEvents: [], baselines: {}, reviewToken: null,
       reviewedAt: null, unreadTotal: 0, coverage: null, sourceNotices: [],
       ...(new URL(req.url).searchParams.get("include") === "quotes" ? { quotes: enrich(symbols, ns, wl.id, user.id) } : {}),
     });
@@ -71,7 +72,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
   });
 
   return NextResponse.json({
-    tracking: true, trackingSince: since, reviewedAt,
+    market, tracking: true, trackingSince: since, reviewedAt,
     events: shownCurrent.map(shape), priorSourceEvents: shownPrior.map(shape),
     baselines, reviewToken, unreadTotal: total, coverage, sourceNotices,
     ...(new URL(req.url).searchParams.get("include") === "quotes"

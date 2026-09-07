@@ -227,6 +227,8 @@ export default function Home() {
       if (!cRes.ok) throw new Error("Refresh failed; showing last loaded state");
       if (reqId !== briefingReq.current) return; // superseded by a newer request
       const c = await cRes.json();
+      if (reqId !== briefingReq.current) return;
+      if (c.market) setMarket(c.market);
       setQuotes((c.quotes ?? []).slice().sort((a: Quote, b: Quote) => b.score - a.score));
       setTracking(c.tracking);
       setTrackingSince(c.trackingSince ?? null);
@@ -340,7 +342,7 @@ export default function Home() {
       const j = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(j.error ?? "Review failed — nothing was acknowledged");
       if (j.reviewed > 0) pushToast(j.reviewed === 1 ? "1 change marked as reviewed" : `${j.reviewed} changes marked as reviewed`);
-      else pushToast("Already reviewed — nothing new to acknowledge");
+      else pushToast("Review baseline updated to the displayed prices");
       await loadBriefing(wlId);
     } catch (e) {
       // Retain everything on screen and offer retry.
@@ -431,18 +433,19 @@ export default function Home() {
     }
   }
 
-  async function openDrawer(sym: string) {
-    setDrawer(sym);
+  function openDrawer(sym: string) { setDrawer(sym); }
+
+  useEffect(() => {
+    let cancelled = false;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset samples when the requested drawer changes
     setHistory([]);
-    try {
-      const r = await fetch(`/api/symbols/${sym}/history?watchlistId=${wlId}`);
-      if (!r.ok) throw new Error("history failed");
-      const j = await r.json();
-      setHistory(j?.samples ?? j?.history ?? []);
-    } catch {
-      pushToast("Could not load recent samples");
-    }
-  }
+    if (!drawer || !wlId) return;
+    void fetch(`/api/symbols/${drawer}/history?watchlistId=${wlId}`)
+      .then(async r => { if (!r.ok) throw new Error("history failed"); return r.json(); })
+      .then(j => { if (!cancelled) setHistory(j?.samples ?? j?.history ?? []); })
+      .catch(() => { if (!cancelled) pushToast("Could not load recent samples"); });
+    return () => { cancelled = true; };
+  }, [drawer, wlId, pushToast]);
 
   function onSearchChange(v: string) {
     setInput(v.toUpperCase());
@@ -571,9 +574,9 @@ export default function Home() {
           <h2 className="text-[14px] font-semibold text-zinc-200">
             Since your last review{!loading && tracking && unreadTotal > 0 ? ` · ${unreadTotal} unread` : ""}
           </h2>
-          {!loading && tracking && (visibleEvents.length + priorVisible.length) > 0 && (
+          {!loading && tracking && reviewToken && quotes.some(q => q.price > 0) && (
             <button onClick={acknowledge} disabled={acking} className="rounded-lg bg-zinc-100 px-2.5 py-1 text-xs font-semibold text-zinc-900 hover:bg-white disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-zinc-400">
-              {acking ? "Reviewing…" : `Mark displayed changes as reviewed (${visibleEvents.length + priorVisible.length})`}
+              {acking ? "Reviewing…" : (visibleEvents.length + priorVisible.length > 0 ? `Mark displayed changes as reviewed (${visibleEvents.length + priorVisible.length})` : "Review current prices")}
             </button>
           )}
         </div>

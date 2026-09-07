@@ -1,5 +1,5 @@
 import { ctx, notFound, requireWatchlist, NextResponse, normalizeSymbol, VALID_SYMBOLS } from "@/lib/shared";
-import { addItem, itemsFor } from "@/lib/db";
+import { addItem } from "@/lib/db";
 import { companyName } from "@/lib/companies";
 
 const MAX_ITEMS = 50;
@@ -18,10 +18,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
   if (!VALID_SYMBOLS.has(symbol) && !companyName(symbol)) {
     return NextResponse.json({ error: `Unknown symbol "${symbol}". Check the ticker and retry.` }, { status: 404 });
   }
-  if (itemsFor(wl.id).length >= MAX_ITEMS) {
+  const { created, limitReached } = addItem(wl.id, symbol, undefined, MAX_ITEMS);
+  if (limitReached) {
     return NextResponse.json({ error: `Watchlist limit is ${MAX_ITEMS} symbols` }, { status: 400 });
   }
-  const { created } = addItem(wl.id, symbol);
   if (!created) return NextResponse.json({ symbol, deduped: true });
   // Membership starts now; a review baseline requires an explicit review.
   return NextResponse.json({ symbol });
